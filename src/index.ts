@@ -1,7 +1,5 @@
-import path from "node:path";
 import { Command } from "@langchain/langgraph";
 import { buildGraph } from "./graph.js";
-import { GENERATED_TESTS_DIR, SESSION_DIR } from "./config.js";
 import { maskedEnvSummary } from "./env.js";
 import type { UserChoice } from "./types.js";
 
@@ -13,9 +11,8 @@ import type { UserChoice } from "./types.js";
  * Both choices are terminal — after `finalize` the graph runs `summary`
  * and ends.
  *
- * Artifacts land in .opencode/sessions/playwright-run and
- * playwright-tests/ai-generated relative to the cwd where you invoke this,
- * unless you pass OUT_PREFIX=./.out/… in the env.
+ * Artifacts land in hyperwright-wrkdir/hcc-{sessionId}/cloned-repo/.ai-test-gen/
+ * Generated tests go to hyperwright-wrkdir/hcc-{sessionId}/cloned-repo/playwright-tests/ai-generated/
  */
 const VALID_CHOICES: UserChoice[] = ["commit-push", "cleanup"];
 
@@ -29,17 +26,14 @@ async function main() {
       ? "heal failing tests for module: payments"
       : "generate tests for module: payments";
 
-  const prefix = process.env.OUT_PREFIX ?? "";
-  const sessionDir = path.join(prefix, SESSION_DIR);
-  const testsDir = path.join(prefix, GENERATED_TESTS_DIR);
-
   const graph = buildGraph();
-  const config = { configurable: { thread_id: `demo-${demo}-${Date.now()}` } };
+  const threadId = `demo-${demo}-${Date.now()}`;
+  const config = { configurable: { thread_id: threadId } };
 
   console.log(`\n=== Running demo: ${demo} ===`);
   console.log(`env: ${maskedEnvSummary()}\n`);
 
-  const first = await graph.invoke({ rawInput, sessionDir, testsDir }, config);
+  const first = await graph.invoke({ rawInput, sessionId: threadId }, config);
 
   const snap = await graph.getState(config);
   const needsResume =
@@ -56,8 +50,8 @@ async function main() {
   } else {
     printLogs(first.logs);
   }
-  console.log(`\nArtifacts in: ${sessionDir}`);
-  console.log(`Generated tests in: ${testsDir}`);
+  console.log(`\nSession ID: ${threadId}`);
+  console.log(`Artifacts in: hyperwright-wrkdir/hcc-${threadId}/cloned-repo/.ai-test-gen/`);
 }
 
 function printLogs(logs: string[]) {

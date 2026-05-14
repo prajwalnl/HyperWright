@@ -1,15 +1,30 @@
 import { EventEmitter } from "node:events";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import fs from "node:fs/promises";
 import { Command } from "@langchain/langgraph";
 import { buildGraph, type CompiledQAGraph } from "../../src/graph.js";
-import { GENERATED_TESTS_DIR, SESSION_DIR } from "../../src/config.js";
 import { readJson, writeJson } from "../../src/session/files.js";
 import { logger } from "../../src/session/logger.js";
 import type { QAStateType } from "../../src/state.js";
 import type { TargetType, UserChoice } from "../../src/types.js";
 import type { WorkflowEvent, WorkflowSnapshot } from "./types.js";
 import { glob } from "node:fs/promises";
+
+// Resolve workspace root for session discovery
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const WORKSPACE_ROOT = path.resolve(__dirname, "../..");
+const HYPERWRIGHT_WRKDIR = path.join(WORKSPACE_ROOT, "hyperwright-wrkdir");
+
+/**
+ * Compute the session directory path based on sessionId.
+ * Sessions are stored in hyperwright-wrkdir/hcc-{sessionId}/cloned-repo/.ai-test-gen/
+ */
+function getSessionDir(sessionId: string): string {
+  return path.join(HYPERWRIGHT_WRKDIR, `hcc-${sessionId}`, "cloned-repo", ".ai-test-gen");
+}
 
 type TerminalEvent =
   | { type: "finished"; status: WorkflowSnapshot["status"] }
@@ -51,8 +66,8 @@ class Runner extends EventEmitter {
     void this.loadLatestRun();
   }
 
-  private getLogsPath(threadId: string): string {
-    return path.join(".web-ui-run", SESSION_DIR, threadId, "web-ui-logs.json");
+  private getLogsPath(sessionId: string): string {
+    return path.join(getSessionDir(sessionId), "web-ui-logs.json");
   }
 
   private async saveLogs(): Promise<void> {
@@ -63,16 +78,17 @@ class Runner extends EventEmitter {
   }
 
   private async loadLatestRun(): Promise<void> {
-    const baseDir = path.join(".web-ui-run", SESSION_DIR);
-    const sessions: Array<{ threadId: string; mtime: Date }> = [];
+    const sessions: Array<{ sessionId: string; mtime: Date }> = [];
 
     try {
-      for await (const entry of glob("*/web-ui-logs.json", { cwd: baseDir, withFileTypes: true })) {
+      for await (const entry of glob("hcc-*/cloned-repo/.ai-test-gen/web-ui-logs.json", { cwd: HYPERWRIGHT_WRKDIR, withFileTypes: true })) {
         if (entry.isFile()) {
-          const threadId = entry.parentPath.split("/").pop() || "";
-          const stats = await entry.stat().catch(() => null);
-          if (stats && threadId) {
-            sessions.push({ threadId, mtime: stats.mtime });
+          const parts = entry.parentPath.split("/");
+          const hccDir = parts.find((p) => p.startsWith("hcc-"));
+          const sessionId = hccDir?.replace("hcc-", "") || "";
+          const stats = await fs.stat(path.join(entry.parentPath, entry.name)).catch(() => null);
+          if (stats && sessionId) {
+            sessions.push({ sessionId, mtime: stats.mtime });
           }
         }
       }
@@ -85,18 +101,18 @@ class Runner extends EventEmitter {
     sessions.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
     const latest = sessions[0];
 
-    await this.loadRun(latest.threadId);
+    await this.loadRun(latest.sessionId);
   }
 
-  private async loadRun(threadId: string): Promise<void> {
-    const logsPath = this.getLogsPath(threadId);
+  private async loadRun(sessionId: string): Promise<void> {
+    const logsPath = this.getLogsPath(sessionId);
     const logsData = await readJson<Record<string, string[]>>(logsPath);
     if (!logsData) return;
 
-    const sessionPath = path.join(".web-ui-run", SESSION_DIR, threadId, "session.json");
+    const sessionPath = path.join(getSessionDir(sessionId), "session.json");
     const sessionData = await readJson<{ status: string; phase: string }>(sessionPath);
 
-    this.threadId = threadId;
+    this.threadId = sessionId;
     this.logsByNode = new Map(Object.entries(logsData));
     this.currentNodes = [];
 
@@ -111,19 +127,20 @@ class Runner extends EventEmitter {
   }
 
   async listSessions(): Promise<Array<{ threadId: string; startedAt: string; status: string }>> {
-    const baseDir = path.join(".web-ui-run", SESSION_DIR);
     const sessions: Array<{ threadId: string; startedAt: string; status: string; mtime: Date }> = [];
 
     try {
-      for await (const entry of glob("*/session.json", { cwd: baseDir, withFileTypes: true })) {
+      for await (const entry of glob("hcc-*/cloned-repo/.ai-test-gen/session.json", { cwd: HYPERWRIGHT_WRKDIR, withFileTypes: true })) {
         if (entry.isFile()) {
           const parts = entry.parentPath.split("/");
-          const threadId = parts[parts.length - 1] || "";
-          const sessionData = await readJson<{ startedAt: string; status: string }>(entry.fullpath());
-          const stats = await entry.stat().catch(() => null);
-          if (sessionData && threadId && stats) {
+          const hccDir = parts.find((p) => p.startsWith("hcc-"));
+          const sessionId = hccDir?.replace("hcc-", "") || "";
+          const filePath = path.join(entry.parentPath, entry.name);
+          const sessionData = await readJson<{ startedAt: string; status: string }>(filePath);
+          const stats = await fs.stat(filePath).catch(() => null);
+          if (sessionData && sessionId && stats) {
             sessions.push({
-              threadId,
+              threadId: sessionId,
               startedAt: sessionData.startedAt,
               status: sessionData.status,
               mtime: stats.mtime,
@@ -139,16 +156,16 @@ class Runner extends EventEmitter {
     return sessions.map(({ threadId, startedAt, status }) => ({ threadId, startedAt, status }));
   }
 
-  async loadSession(threadId: string): Promise<boolean> {
-    const logsPath = this.getLogsPath(threadId);
+  async loadSession(sessionId: string): Promise<boolean> {
+    const logsPath = this.getLogsPath(sessionId);
     const logsData = await readJson<Record<string, string[]>>(logsPath);
     if (!logsData) return false;
 
-    this.threadId = threadId;
+    this.threadId = sessionId;
     this.logsByNode = new Map(Object.entries(logsData));
     this.currentNodes = [];
 
-    const sessionPath = path.join(".web-ui-run", SESSION_DIR, threadId, "session.json");
+    const sessionPath = path.join(getSessionDir(sessionId), "session.json");
     const sessionData = await readJson<{
       status: string;
       phase: string;
@@ -169,7 +186,7 @@ class Runner extends EventEmitter {
       this.running = sessionData.status === "in_progress";
       this.awaitingChoice = sessionData.phase === "awaiting-user-choice";
       this.lastSnapshot = {
-        sessionId: threadId,
+        sessionId,
         rawInput: sessionData.rawInput || "",
         target: sessionData.target || "",
         targetType: sessionData.targetType as TargetType,
@@ -249,15 +266,14 @@ class Runner extends EventEmitter {
     this.graph = buildGraph();
     const graph = this.graph;
 
-    // Initialize real-time logger for this session. The "log" subscription
-    // itself is set up once in the constructor (see above).
-    const sessionDir = path.join(".web-ui-run", SESSION_DIR, thread);
-    logger.initialize(sessionDir);
+    // sessionDir is computed by setupContext (inside cloned-repo/.ai-test-gen).
+    // Logger is initialized lazily when consume() sees the first state update
+    // that carries sessionDir.
 
     const init: Partial<QAStateType> = {
       rawInput,
-      sessionDir: path.join(".web-ui-run", SESSION_DIR, thread),
-      testsDir: path.join(".web-ui-run", GENERATED_TESTS_DIR, thread),
+      sessionId: thread,
+      // sessionDir/testsDir will be set by setupContext
     };
     if (targetType) (init as Record<string, unknown>).targetType = targetType;
     if (typeof maxHealingAttempts === "number") {
@@ -426,7 +442,15 @@ class Runner extends EventEmitter {
       await this.saveLogs();
 
       const snap = await this.graph.getState(config);
-      this.lastSnapshot = toSnapshot(snap.values as QAStateType);
+      const state = snap.values as QAStateType;
+      this.lastSnapshot = toSnapshot(state);
+
+      // Deferred logger initialization: setupContext computes sessionDir inside
+      // the cloned repo; once it's available, initialize the logger so subsequent
+      // logs are persisted to disk in the correct location.
+      if (state.sessionDir) {
+        logger.initialize(state.sessionDir);
+      }
 
       const nextNodes = snap.next as string[];
 

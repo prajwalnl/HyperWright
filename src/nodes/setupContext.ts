@@ -444,6 +444,8 @@ export async function setupContextNode(
     pr,
     phase: "setup",
     startedAt,
+    sessionDir: aiGenFlowDir,
+    testsDir: path.join(repoPath, "playwright-tests", "ai-generated"),
     repo: {
       repoPath,
       repoCloned: true,

@@ -315,8 +315,8 @@ async function doCleanup(
   // 1) Generated spec files.
   await execStepBestEffort(`rm -f "${testsDir}"/*.spec.ts`, repoPath, l);
 
-  // 2) AI scratch dir inside the cloned repo.
-  await execStepBestEffort(`rm -rf "${repoPath}/.ai-test-gen"`, repoPath, l);
+  // 2) AI scratch files inside the cloned repo (preserve session artifacts).
+  await execStepBestEffort(`rm -f "${repoPath}/.ai-test-gen/input-context.json"`, repoPath, l);
 
   // 3) Per-run JSON artifacts in sessionDir. session.json + logs/ stay.
   const paths = sessionPaths(sessionDir);
