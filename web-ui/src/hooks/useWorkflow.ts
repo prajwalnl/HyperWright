@@ -93,8 +93,6 @@ export interface WorkflowState {
 // say setupContext has finished — setupBackend/setupFrontend/setupJoin are
 // tracked via per-chunk currentNodes as they actually complete.
 const PHASE_TO_NODES: Record<string, string[]> = {
-  clone: ["setupContext"],
-  parse: ["setupContext"],
   setup: ["setupContext"],
   planning: ["planTests"],
   "planning-complete": ["planTests"],

@@ -41,7 +41,7 @@ export const QAState = Annotation.Root({
     default: () => "module",
   }),
 
-  phase: Annotation<Phase>({ reducer: lastWriteWins, default: () => "parse" }),
+  phase: Annotation<Phase>({ reducer: lastWriteWins, default: () => "setup" }),
   status: Annotation<Status>({
     reducer: lastWriteWins,
     default: () => "in_progress",

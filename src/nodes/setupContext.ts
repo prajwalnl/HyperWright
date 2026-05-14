@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { fetchPullRequest } from "../runtime/gh.js";
 import { ensureDir, writeJson } from "../session/files.js";
 import { loggerFor } from "../session/log.js";
@@ -11,10 +12,19 @@ import type { InputContext, TargetType } from "../types.js";
 
 const DEFAULT_REPO_URL = "https://github.com/juspay/hyperswitch-control-center.git";
 const DEFAULT_REPO_SLUG = "juspay/hyperswitch-control-center";
-const BASE_CLONE_DIR = "/Users/prajwal.nl/hcc-tmp";
+
+// Resolve workspace root relative to this file (src/nodes/setupContext.ts -> ../../)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const WORKSPACE_ROOT = path.resolve(__dirname, "../..");
+const BASE_CLONE_DIR = path.join(WORKSPACE_ROOT, "hyperwright-wrkdir");
 
 function getCloneDir(sessionId: string): string {
-  return `${BASE_CLONE_DIR}/hcc-${sessionId}`;
+  return path.join(BASE_CLONE_DIR, `hcc-${sessionId}`);
+}
+
+function getRepoPath(sessionId: string): string {
+  return path.join(getCloneDir(sessionId), "cloned-repo");
 }
 
 /**
@@ -49,10 +59,6 @@ async function runWithTimeout(
     void run("pkill", ["-9", "-f", `${cmd} clone`], {}).catch(() => undefined);
   }
   return result;
-}
-
-function getRepoPath(sessionId: string): string {
-  return `${getCloneDir(sessionId)}/hyperswitch-control-center`;
 }
 
 /**
@@ -197,7 +203,9 @@ export async function setupContextNode(
       "1",
       "--progress",
       "--no-tags",
-      "--single-branch",
+      // Note: --single-branch is intentionally omitted so that gh pr checkout
+      // can set up tracking for arbitrary PR branches. Shallow clone (--depth 1)
+      // keeps it fast without sacrificing ability to checkout PRs.
       DEFAULT_REPO_URL,
       repoPath,
     ],
@@ -211,9 +219,15 @@ export async function setupContextNode(
         GIT_TERMINAL_PROMPT: "0",
         GIT_ASKPASS: "/usr/bin/false",
       },
-      // Stream git's --progress output (it writes to stderr) so the user can
-      // see "Receiving objects: 42% …" instead of staring at silence.
-      onStderr: (line: string) => l(`[setup]   git: ${line}`),
+      // Compact git progress: only log major milestones to reduce noise.
+      // Git writes progress to stderr with lines like "Receiving objects: 42% (1234/2923)"
+      onStderr: (line: string) => {
+        // Only log completion milestones or important phases
+        const milestoneMatch = line.match(/(remote: Counting objects|Receiving objects:\s*(100%|5)0%|Resolving deltas:\s*(100%|5)0%|Checking out files)/);
+        if (milestoneMatch) {
+          l(`[setup]   git: ${line.trim()}`);
+        }
+      },
     },
     600_000, // 10-minute hard cap; the lowSpeedLimit guard above usually
     //          trips first when the network is the problem.
@@ -248,6 +262,12 @@ export async function setupContextNode(
   }
 
   l(`[setup] Repository cloned to ${repoPath}`);
+
+  // After a shallow clone, reconfigure the remote to fetch all branches so
+  // that gh pr checkout can set up tracking for arbitrary PR branches.
+  l(`[setup] Configuring remote to fetch all branches...`);
+  await run("git", ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], { cwd: repoPath });
+  l(`[setup] Remote configured`);
 
   // --- Branch Selection & Checkout ---
   //
@@ -351,9 +371,11 @@ export async function setupContextNode(
         prCheckoutSucceeded = true;
         l(`[setup] PR #${target} is open — checked out on branch: ${checkedOutBranch}`);
       } else {
+        const errMsg = prCheckoutResult.stderr?.trim() || "(no error output)";
         l(
-          `[setup] gh pr checkout failed for #${target} (branch likely deleted post-merge or gh unavailable) — falling back to a new session branch`,
+          `[setup] gh pr checkout failed for #${target}: ${errMsg}`,
         );
+        l(`[setup] Falling back to a new session branch...`);
       }
     }
 

@@ -3,8 +3,6 @@ export type Mode = "full" | "heal-only";
 export type TargetType = "pr" | "branch" | "module" | "scenario";
 
 export type Phase =
-  | "clone"
-  | "parse"
   | "setup"
   | "planning"
   | "planning-complete"
