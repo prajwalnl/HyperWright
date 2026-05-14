@@ -14,13 +14,7 @@ HyperWright transforms PRs into tested PRs. It's a **LangGraph StateGraph** that
 4. **Ship** — Open companion PR with tests, traces, and bug reports
 
 ### Why We Built It
-
-| Before (Cypress) | After (HyperWright) |
-|------------------|---------------------|
-| 60 tests, 14 min | **388 tests, 8 min** (-43%) |
-| Manual selectors | **AI-discovered selectors** |
-| No type safety | **TypeScript + compile-time validation** |
-| Broken tests pile up | **Self-healing with MCP** |
+Testing is critical but often neglected due to time constraints and maintenance overhead. HyperWright automates the heavy lifting while keeping humans in the loop for final approval. By leveraging LLMs for both generation and healing, we can create robust tests that evolve with your app — no more brittle, outdated suites.
 
 ## Quick Start
 
@@ -41,23 +35,17 @@ cd web-ui && pnpm dev
 ## Architecture
 
 ```
-┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
-│  Input  │───▶│  Setup  │───▶│  Plan   │───▶│ Generate│
-└─────────┘    └─────────┘    │ (LLM)   │    │ (LLM)   │
-                              └─────────┘    └────┬────┘
-                                                  │
-┌─────────┐    ┌─────────┐    ┌─────────┐        │
-│  Ship   │◀───│ Cleanup │◀───│   HITL  │◀───────┼────┐
-│  (PR)   │    │         │    │ (Pause) │        │    │
-└─────────┘    └─────────┘    └─────────┘        │    │
-                                                 ▼    │
-                                          ┌─────────┐ │
-                                          │  Heal   │─┘ (retry ≤3)
-                                          │(Run+Fix)│
-                                          └─────────┘
+┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐
+│  Input  │───▶│  Setup  │───▶│  Plan   │───▶│ Generate│───▶│  Heal   │───▶│   HITL  │───▶│ Cleanup │───▶│   Ship  │
+└─────────┘    └─────────┘    │ (LLM)   │    │ (LLM)   │    │(Run+Fix)│    │ (Pause) │    │         │    │   (PR)  │
+                              └─────────┘    └─────────┘    └─────────┘    └─────────┘    └─────────┘    └─────────┘
+                                   ▲                             │
+                                   │                             │ 
+                                   └─────────────────────────────┘
+                                            (retry ≤10)
 ```
 
-**Key insight**: The model decides *what* to test. The graph decides *flow* — with checkpointing, branching, and healing loops.
+**Key insight**: The model decides *what* and *how* to test. The graph decides the *flow* — with checkpointing, branching, and healing loops.
 
 ## Features
 
@@ -71,8 +59,8 @@ cd web-ui && pnpm dev
 
 <!-- SCREENSHOT_PLACEHOLDER: Web UI showing live graph -->
 
-Dark-themed React + Hono dashboard featuring:
-- Live graph visualization (nodes pulse during execution)
+React + Hono dashboard featuring:
+- Live graph visualization
 - Per-node streaming logs
 - Real-time metrics & HITL controls
 
@@ -85,7 +73,7 @@ cd web-ui && pnpm dev  # http://localhost:5173
 ```
 Test fails → Capture trace → LLM analyzes → Proposes fix → Applies edit → Re-runs
      ↑___________________________________________________________________________│
-                                    (up to 3 attempts)
+                                    (up to 10 attempts)
 ```
 
 If healing fails, the PR still ships with `bug-report.md` — failures never disappear.
@@ -167,7 +155,7 @@ Outputs typed specs following project conventions:
 - `scenario-{slug}.spec.ts`
 
 ### 4. Self-Healing Loop
-Runs tests → parses failures → LLM proposes `{find, replace}` edits → applies surgically → retries. Up to 3 attempts.
+Runs tests → parses failures → LLM proposes `{find, replace}` edits → applies surgically → retries. Up to 10 attempts.
 
 ### 5. Human-in-the-Loop
 Interrupts for approval:
