@@ -22,13 +22,37 @@ export async function setupBackendNode(
   l(`[setup-backend] Backend was ${wasUp ? "UP" : "DOWN"}`);
 
   let backendWasStarted = false;
+  let backendPid: number | null = null;
   let ok = wasUp;
 
   if (!wasUp) {
     l(`[setup-backend] Backend not running, starting...`);
     l(`[setup-backend] Start script: ${ENV.backend.startScript}`);
-    spawnBackground("sh", [ENV.backend.startScript], { cwd: repoPath });
+
+    let child;
+    try {
+      child = spawnBackground("sh", [ENV.backend.startScript], { cwd: repoPath });
+    } catch (spawnErr) {
+      const msg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
+      l(`[setup-backend] ERROR: Failed to spawn backend start script: ${msg}`);
+      l(`[setup-backend] ========================================`);
+      return respond(state, {
+        phase: "failed",
+        status: "failed",
+        error: `Failed to spawn backend: ${msg}`,
+        servers: { backendUp: false, backendWasStarted: false, backendPid: null },
+        logs,
+      });
+    }
+
+    // Listen for immediate spawn errors (e.g., script not found)
+    child.on("error", (err) => {
+      l(`[setup-backend] Spawn error event: ${err.message}`);
+    });
+
+    backendPid = child.pid ?? null;
     backendWasStarted = true;
+    l(`[setup-backend] Backend spawned with PID: ${backendPid ?? "unknown"}`);
     l(`[setup-backend] Waiting for backend to become reachable...`);
     l(`[setup-backend] Timeout: ${ENV.backend.startTimeoutMs}ms, Poll interval: ${ENV.backend.pollStepMs}ms`);
 
@@ -44,23 +68,30 @@ export async function setupBackendNode(
 
   if (!ok) {
     l(`[setup-backend] ERROR: Backend did not come up`);
+    if (backendPid) {
+      l(`[setup-backend] Killing backend process ${backendPid}...`);
+      try { process.kill(backendPid); } catch { /* already gone */ }
+    }
     l(`[setup-backend] ========================================`);
     return respond(state, {
       phase: "failed",
       status: "failed",
       error: `Backend did not come up at ${ENV.backend.healthUrl}`,
-      servers: { backendUp: false, backendWasStarted },
+      servers: { backendUp: false, backendWasStarted, backendPid },
       logs,
     });
   }
 
   l(`[setup-backend] Backend is UP and reachable`);
   l(`[setup-backend] Backend ${wasUp ? "was already up" : "was started"}`);
+  if (backendPid) {
+    l(`[setup-backend] Backend PID: ${backendPid}`);
+  }
   l(`[setup-backend] NODE COMPLETE`);
   l(`[setup-backend] ========================================`);
 
   return respond(state, {
-    servers: { backendUp: true, backendWasStarted },
+    servers: { backendUp: true, backendWasStarted, backendPid },
     logs,
   });
 }

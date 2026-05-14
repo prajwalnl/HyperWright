@@ -93,10 +93,31 @@ export async function setupFrontendNode(
 
   l(`[setup-frontend] Step 3/4: Starting frontend server...`);
   l(`[setup-frontend] Start command: ${ENV.frontend.startCmd}`);
-  const child = spawnBackground("sh", ["-c", `cd "${repoPath}" && ${ENV.frontend.startCmd}`]);
+
+  let child;
+  try {
+    child = spawnBackground("sh", ["-c", `cd "${repoPath}" && ${ENV.frontend.startCmd}`]);
+  } catch (spawnErr) {
+    const msg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
+    l(`[setup-frontend] ERROR: Failed to spawn frontend start command: ${msg}`);
+    l(`[setup-frontend] ========================================`);
+    return respond(state, {
+      phase: "failed",
+      status: "failed",
+      error: `Failed to spawn frontend: ${msg}`,
+      servers: { frontendUp: false, frontendWasStarted: false, frontendPid: null },
+      logs,
+    });
+  }
+
+  // Listen for immediate spawn errors (e.g., command not found)
+  child.on("error", (err) => {
+    l(`[setup-frontend] Spawn error event: ${err.message}`);
+  });
+
   child.unref();
   const frontendPid = child.pid ?? null;
-  l(`[setup-frontend] Frontend spawned with PID: ${frontendPid}`);
+  l(`[setup-frontend] Frontend spawned with PID: ${frontendPid ?? "unknown"}`);
 
   l(`[setup-frontend] Step 4/4: Waiting for frontend to become reachable...`);
   l(`[setup-frontend] Timeout: ${ENV.frontend.startTimeoutMs}ms, Poll interval: ${ENV.frontend.pollStepMs}ms`);

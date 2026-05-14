@@ -8,7 +8,8 @@
     "phase-trace": "tsx scripts/phase-trace.ts",
     "dev": "pnpm --filter @examples/playwright-web-ui dev",
     "build": "pnpm --filter @examples/playwright-web-ui build",
-    "start": "pnpm --filter @examples/playwright-web-ui start"
+    "start": "pnpm --filter @examples/playwright-web-ui start",
+    "postinstall": "playwright install chromium"
   },
   "devDependencies": {
     "@langchain/core": "^1.1.40",

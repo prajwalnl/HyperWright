@@ -57,6 +57,7 @@ export interface Servers {
   frontendUp: boolean;
   backendWasStarted: boolean;
   frontendWasStarted: boolean;
+  backendPid: number | null;
   frontendPid: number | null;
 }
 

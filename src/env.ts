@@ -41,7 +41,7 @@ export const ENV = {
       "playwright-tests/start_hyperswitch.sh",
     ),
     stopCwd: opt("HYPERSWITCH_STOP_CWD", "hyperswitch"),
-    startTimeoutMs: Number(opt("BACKEND_START_TIMEOUT_MS", "240000")),
+    startTimeoutMs: Number(opt("BACKEND_START_TIMEOUT_MS", "300000")),
     pollStepMs: Number(opt("BACKEND_POLL_STEP_MS", "5000")),
   },
   frontend: {
@@ -49,7 +49,7 @@ export const ENV = {
     port: Number(opt("FRONTEND_PORT", "9000")),
     buildCmd: opt("FRONTEND_BUILD_CMD", "npm run re:start"),
     startCmd: opt("FRONTEND_START_CMD", "npm run start"),
-    startTimeoutMs: Number(opt("FRONTEND_START_TIMEOUT_MS", "240000")),
+    startTimeoutMs: Number(opt("FRONTEND_START_TIMEOUT_MS", "300000")),
     pollStepMs: Number(opt("FRONTEND_POLL_STEP_MS", "5000")),
   },
   paths: {

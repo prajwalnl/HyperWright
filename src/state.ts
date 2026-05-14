@@ -58,6 +58,7 @@ export const QAState = Annotation.Root({
       frontendUp: false,
       backendWasStarted: false,
       frontendWasStarted: false,
+      backendPid: null,
       frontendPid: null,
     }),
   }),
