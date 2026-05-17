@@ -1,10 +1,13 @@
 import { runPlanner } from "../agents/planner.js";
+import { ENV } from "../env.js";
 import { writeJson } from "../session/files.js";
-import { createNodeLogger, loggerFor } from "../session/log.js";
+import { loggerFor } from "../session/log.js";
 import { sessionPaths } from "../session/paths.js";
 import { respond } from "../session/respond.js";
 import { writeSession } from "../session/sessionFile.js";
 import type { QAStateType, QAStateUpdate } from "../state.js";
+
+const PLANNER_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * Orchestrator Step 3. Delegates to the playwright-planner agent, then writes
@@ -16,17 +19,33 @@ export async function planTestsNode(
   const logs: string[] = [];
   const l = loggerFor("planTests", logs);
 
-  l(`[plan] ========================================`);
-  l(`[plan] NODE START: planTests`);
-  l(`[plan] Target: ${state.targetType}=${state.target}`);
-  l(`[plan] Mode: ${state.mode}`);
-  l(`[plan] Updating session phase to 'planning'...`);
+  const missing = !state.target
+    ? "target"
+    : !state.repo.repoPath
+      ? "repo.repoPath (did setupContext run?)"
+      : !state.sessionDir
+        ? "sessionDir"
+        : null;
+  if (missing) {
+    l(`failure: planTests invoked without ${missing}`);
+    return respond(state, {
+      phase: "failed",
+      status: "failed",
+      error: `planTests called without ${missing}`,
+      logs,
+    });
+  }
 
+  l(`target=${state.targetType}:${state.target} mode=${state.mode}`);
   await writeSession({ ...state, phase: "planning" } as QAStateType);
-  l(`[plan] Session phase updated`);
+
+  // Cap the sub-agent so a hung browser/LLM doesn't pin the workflow. The
+  // signal is combined with the workflow-wide Stop signal inside runSubAgent,
+  // so either source aborts the in-flight call instead of running to completion.
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), PLANNER_TIMEOUT_MS);
 
   try {
-    l(`[plan] Calling planner agent...`);
     const plan = await runPlanner({
       sessionId: state.sessionId,
       mode: state.mode,
@@ -35,23 +54,24 @@ export async function planTestsNode(
       sessionDir: state.sessionDir,
       pr: state.pr,
       creds: state.creds,
-      log: createNodeLogger("planTests"),
+      repoPath: state.repo.repoPath,
+      existingTestsDir: ENV.paths.existingTestsDir,
+      pageObjectsDir: ENV.paths.pageObjectsDir,
+      log: l,
+      signal: ac.signal,
     });
 
-    l(`[plan] Planner returned ${plan.scenarios.length} scenarios`);
-    l(`[plan] Source: ${plan.source}`);
-    l(`[plan] URL: ${plan.url}`);
-    l(`[plan] Preconditions: ${plan.preconditions.apiHelpers.join(",") || "(none)"}`);
+    l(
+      `plan: ${plan.scenarios.length} scenarios, source=${plan.source}, url=${plan.url}`,
+    );
+    if (plan.preconditions.apiHelpers.length > 0) {
+      l(`apiHelpers: ${plan.preconditions.apiHelpers.join(", ")}`);
+    }
 
     const paths = sessionPaths(state.sessionDir);
-    l(`[plan] Writing test plan to: ${paths.testPlan}`);
     await writeJson(paths.testPlan, plan);
-    l(`[plan] Test plan written successfully`);
+    l(`wrote ${paths.testPlan}`);
 
-    l(`[plan] NODE COMPLETE`);
-    l(`[plan] ========================================`);
-
-    l(`[plan] Summary: ${plan.scenarios.length} scenarios for ${plan.source}`);
     return respond(state, {
       testPlan: plan,
       metrics: { testsPlanned: plan.scenarios.length },
@@ -60,14 +80,19 @@ export async function planTestsNode(
       logs,
     });
   } catch (err) {
-    l(`[plan] ERROR: Planning failed - ${(err as Error).message}`);
-    l(`[plan] ========================================`);
-    l(`[plan] failure: ${(err as Error).message}`);
+    const e = err as Error;
+    const msg = ac.signal.aborted
+      ? `Planning timed out after ${PLANNER_TIMEOUT_MS / 60000}m`
+      : e.message;
+    l(`failure: ${msg}`);
+    if (e.stack && !ac.signal.aborted) l(e.stack);
     return respond(state, {
       phase: "failed",
       status: "failed",
-      error: `Planning failed: ${(err as Error).message}`,
+      error: `Planning failed: ${msg}`,
       logs,
     });
+  } finally {
+    clearTimeout(timer);
   }
 }

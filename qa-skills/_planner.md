@@ -85,30 +85,28 @@ If not met, inform orchestrator of missing context and STOP.
 
 ## Planning Workflow (Sub-steps of Orchestrator Step 3)
 
-#### 3.1: Read Input Context
+#### 3.1: Read the Injected Context
 
-Read `input-context.json`:
-
-```json
-{
-  "rawInput": "user message",
-  "mode": "full|heal-only",
-  "target": "#123|auth|description",
-  "targetType": "pr|module|scenario",
-  "timestamp": "ISO",
-  "sessionId": "uuid"
-}
-```
+The orchestrator has already injected everything you need at the top of your
+system prompt (`sessionId`, `mode`, `target`, `module.*`, `dashboardBaseUrl`,
+`sessionDir`, `repoPath`, `existingTestsDir`, `pageObjectsDir`, and — for PR
+targets — the full PR title/body/diff). Do NOT re-read `input-context.json`;
+trust the injected values.
 
 #### 3.2: Analyze Existing Tests & Page Objects
 
-**MANDATORY:** Read existing patterns in `playwright-tests/e2e/**/*.spec.ts`:
+**MANDATORY:** Read existing patterns under the absolute path provided in
+`existingTestsDir` (use `list_dir` then `read_file`):
 
-- Tests targeting same module/feature
+- Tests targeting the same module/feature
 - Common setup patterns in `test.beforeEach`
 - API helpers used
+- **Reuse selectors** verbatim — record them in `selectors.global` so the
+  generator emits tests that match the rest of the suite.
 
-**Read Page Objects** in `playwright-tests/support/pages/` to identify reusable locators.
+**Read Page Objects** at `pageObjectsDir` to identify reusable locator helpers
+and POM classes. Reference them in `scenarios[].selectors` and in
+`references.existingTests[]`.
 
 #### 3.3: Determine Preconditions
 
@@ -259,30 +257,15 @@ Before returning to orchestrator:
 
 #### Return to Orchestrator
 
-**Before returning, close browser sessions:**
+The orchestrator node manages `session.json`, `phase` transitions, and browser
+teardown — do NOT call `browser_close` and do NOT try to edit `session.json`
+yourself.
 
-```typescript
-await skill_mcp({
-  mcp_name: "playwright",
-  tool_name: "browser_close",
-});
-```
-
-Update `session.json`:
-
-```json
-{
-  "phase": "planning-complete",
-  "metrics": { "testsPlanned": N }
-}
-```
-
-Report:
+After `planner_save_plan` succeeds, reply with a one-line confirmation:
 
 ```
 Planning complete. {N} scenarios created.
-- Page explored using browser tools
-- Preconditions determined from: [tests analyzed]
+- Preconditions: [list]
 - API helpers: [list]
-- Target module: {module} with prerequisites: [list]
+- Target module: {module}
 ```

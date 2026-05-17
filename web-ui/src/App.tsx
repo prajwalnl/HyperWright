@@ -24,20 +24,35 @@ export function App() {
   const [frozenMs, setFrozenMs] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
+  // All UI state derives from runStatus. Keeping the derivations in one
+  // block (instead of scattering `state.running` / `state.finished` checks
+  // across the component) makes the button-enablement table the only place
+  // that needs to change when the lifecycle grows new states.
+  const isRunning = state.runStatus === "running";
+  const isPaused = state.runStatus === "paused";
+  const isStopping = state.runStatus === "stopping";
+  const isStopped = state.runStatus === "stopped";
+  const isComplete = state.runStatus === "complete";
+  const isFailedStatus = state.runStatus === "failed";
+  const isTerminal = isStopped || isComplete || isFailedStatus;
+  // Active = the run is occupying the system in any non-terminal, non-idle
+  // sense (graph running, paused at HITL, or unwinding stop). Used to drive
+  // the elapsed-time ticker and to disable Reset.
+  const isActive = isRunning || isPaused || isStopping;
+
   useEffect(() => {
-    if (!state.running) return;
+    if (!isActive) return;
     setNow(Date.now());
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [state.running]);
+  }, [isActive]);
 
   useEffect(() => {
-    if (state.running) {
+    if (isActive) {
       setFrozenMs(null);
       return;
     }
-    const ended = state.finished || state.stopped || !!state.error;
-    if (!ended) return;
+    if (!isTerminal && !state.error) return;
     const snapStart = state.snapshot?.startedAt
       ? Date.parse(state.snapshot.startedAt)
       : null;
@@ -48,17 +63,16 @@ export function App() {
     const e = snapEnd ?? Date.now();
     if (s != null) setFrozenMs(e - s);
   }, [
-    state.running,
-    state.finished,
-    state.stopped,
+    isActive,
+    isTerminal,
     state.error,
     state.snapshot?.startedAt,
     state.snapshot?.completedAt,
     localStart,
   ]);
 
-  const failed = state.snapshot?.status === "failed" || !!state.error;
-  const hasSession = !!state.snapshot || state.finished || !!state.error || state.stopped;
+  const failed = state.snapshot?.status === "failed" || isFailedStatus || !!state.error;
+  const hasSession = !!state.snapshot || isTerminal;
 
   const snapStart = state.snapshot?.startedAt
     ? Date.parse(state.snapshot.startedAt)
@@ -67,7 +81,7 @@ export function App() {
   const elapsedMs =
     frozenMs != null
       ? frozenMs
-      : startMs != null && state.running
+      : startMs != null && isActive
         ? now - startMs
         : null;
 
@@ -104,9 +118,9 @@ export function App() {
         <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
           {elapsedMs != null && (
             <span
-              className={`run-timer ${state.running ? "running" : "frozen"}`}
+              className={`run-timer ${isActive ? "running" : "frozen"}`}
               title={
-                state.running
+                isActive
                   ? "Elapsed — workflow is running"
                   : "Elapsed — workflow has ended"
               }
@@ -131,32 +145,28 @@ export function App() {
             </span>
           )}
           {(() => {
-            const label = state.awaitingChoice
-              ? "paused"
-              : state.running
-                ? "live"
-                : state.stopped
-                  ? "stopped"
-                  : state.finished
-                    ? failed
-                      ? "failed"
-                      : "finished"
-                    : "ready";
-            const cls = state.awaitingChoice
-              ? "status-running"
-              : state.running
-                ? "status-running"
-                : state.stopped
-                  ? "status-failed"
-                  : state.finished
-                    ? failed
-                      ? "status-failed"
-                      : "status-complete"
-                    : "status-idle";
+            const label: Record<typeof state.runStatus, string> = {
+              idle: "ready",
+              running: "live",
+              paused: "paused",
+              stopping: "stopping…",
+              stopped: "stopped",
+              complete: failed ? "failed" : "finished",
+              failed: "failed",
+            };
+            const cls: Record<typeof state.runStatus, string> = {
+              idle: "status-idle",
+              running: "status-running",
+              paused: "status-running",
+              stopping: "status-running",
+              stopped: "status-failed",
+              complete: failed ? "status-failed" : "status-complete",
+              failed: "status-failed",
+            };
             return (
-              <span className={`status-badge ${cls}`}>
+              <span className={`status-badge ${cls[state.runStatus]}`}>
                 <span className="status-dot" />
-                {label}
+                {label[state.runStatus]}
               </span>
             );
           })()}
@@ -165,17 +175,26 @@ export function App() {
 
       <aside className="panel panel-left">
         <InputPanel
-          disabled={state.running}
-          canStop={state.running && !state.awaitingChoice}
-          canReset={hasSession}
+          // Button-enablement table per the lifecycle spec:
+          //   idle    : Start ✓  Stop ✗  Reset ✗
+          //   running : Start ✗  Stop ✓  Reset ✗  (must Stop first)
+          //   paused  : Start ✗  Stop ✓  Reset ✗  (Stop allowed at HITL)
+          //   stopping: Start ✗  Stop ✗  Reset ✗  (spinner; wait for stopped)
+          //   stopped : Start ✓  Stop ✗  Reset ✓
+          //   failed  : Start ✓  Stop ✗  Reset ✓
+          //   complete: Start ✓  Stop ✗  Reset ✓
+          startDisabled={isActive}
+          canStop={isRunning || isPaused}
+          canReset={hasSession && isTerminal}
+          isStopping={isStopping}
           onStart={handleStart}
           onStop={handleStop}
           onReset={handleReset}
         />
         <StatusPanel
           snapshot={state.snapshot}
-          running={state.running}
-          finished={state.finished}
+          running={isRunning}
+          finished={isComplete || isFailedStatus}
           error={state.error}
         />
       </aside>
@@ -199,10 +218,10 @@ export function App() {
           logsByNode={state.logsByNode}
           globalLogs={state.snapshot?.logs ?? []}
         />
-        {state.awaitingChoice && (
+        {isPaused && (
           <HITLBar
             onChoose={resume}
-            disabled={!state.awaitingChoice}
+            disabled={!isPaused}
             isNewBranch={state.snapshot?.repo?.isNewBranch ?? false}
           />
         )}

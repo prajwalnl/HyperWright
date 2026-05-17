@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 import { createWriteStream, existsSync, mkdirSync } from "node:fs";
-import { readFile, rename, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile, rename } from "node:fs/promises";
+import { join } from "node:path";
 import type { WriteStream } from "node:fs";
 
 interface NodeLogger {
@@ -22,15 +22,36 @@ interface NodeLogger {
 class LoggerService extends EventEmitter {
   private loggers = new Map<string, NodeLogger>();
   private sessionDir: string | null = null;
+  /**
+   * Lines logged before initialize() arrives. setupContext is the canonical
+   * case — it runs before sessionDir exists (it *computes* sessionDir), so
+   * its log lines would otherwise be dropped from the file (the EventEmitter
+   * still fires, so the SSE/UI side is fine — only the per-node .log file
+   * is missing). Buffered here and flushed on initialize().
+   */
+  private pendingLines = new Map<string, string[]>();
 
   /**
    * Initialize the logger for a new session.
    * Call this when a workflow starts.
+   *
+   * Idempotent: re-calling with the same sessionDir is a no-op so consume()
+   * can call this on every chunk without thrashing open streams.
    */
   initialize(sessionDir: string): void {
+    if (this.sessionDir === sessionDir) return;
     this.cleanup();
     this.sessionDir = sessionDir;
     this.ensureLogDir();
+
+    // Flush anything logged before sessionDir was known (e.g. setupContext).
+    for (const [node, lines] of this.pendingLines) {
+      const logger = this.getOrCreateLogger(node);
+      if (logger.stream.writable && !logger.stream.destroyed) {
+        for (const line of lines) logger.stream.write(line + "\n");
+      }
+    }
+    this.pendingLines.clear();
   }
 
   /**
@@ -41,15 +62,24 @@ class LoggerService extends EventEmitter {
    * process. We skip the file write if the stream is no longer writable and
    * still emit the realtime event so the (still-subscribed) SSE clients keep
    * seeing late lines from a torn-down run.
+   *
+   * If called before initialize(), the line is buffered in `pendingLines`
+   * and replayed to disk once sessionDir is known.
    */
   log(node: string, line: string): void {
-    try {
-      const logger = this.getOrCreateLogger(node);
-      if (logger.stream.writable && !logger.stream.destroyed) {
-        logger.stream.write(line + "\n");
+    if (!this.sessionDir) {
+      const buf = this.pendingLines.get(node) ?? [];
+      buf.push(line);
+      this.pendingLines.set(node, buf);
+    } else {
+      try {
+        const logger = this.getOrCreateLogger(node);
+        if (logger.stream.writable && !logger.stream.destroyed) {
+          logger.stream.write(line + "\n");
+        }
+      } catch {
+        /* logger torn down mid-write — drop the file write, keep realtime */
       }
-    } catch {
-      /* logger not initialised / dir gone — drop the file write, keep realtime */
     }
     this.emit("log", { node, line, timestamp: Date.now() });
   }
@@ -106,6 +136,7 @@ class LoggerService extends EventEmitter {
     }
     this.loggers.clear();
     this.sessionDir = null;
+    this.pendingLines.clear();
   }
 
   /**

@@ -1,4 +1,6 @@
 import { spawn, type SpawnOptions, type ChildProcess } from "node:child_process";
+import { registry } from "./registry.js";
+import { getRuntimeSignal } from "./context.js";
 
 export interface ExecResult {
   code: number | null;
@@ -22,6 +24,10 @@ export type RunOptions = SpawnOptions & {
  * Run a command to completion. Captures stdout/stderr. Never throws; caller
  * inspects the exit code. If `onStdout` / `onStderr` are provided, they are
  * invoked once per complete line as the child writes it.
+ *
+ * Children are registered with the ProcessRegistry for the lifetime of the
+ * call, so runner.stop() can SIGTERM any still-running ones (long-lived
+ * `npm install` / `git clone` / `playwright test`).
  */
 export async function run(
   cmd: string,
@@ -34,6 +40,25 @@ export async function run(
       ...spawnOpts,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    const trackedPid = child.pid;
+    if (typeof trackedPid === "number") registry.trackRun(trackedPid);
+
+    // Honor the workflow-scoped AbortSignal so Stop interrupts long-running
+    // children (npm install, git clone, playwright test) instead of letting
+    // them run to completion in the background. SIGTERM first; the registry
+    // killAll() in stop() handles SIGKILL escalation for survivors.
+    const signal = getRuntimeSignal();
+    let onAbort: (() => void) | null = null;
+    if (signal) {
+      if (signal.aborted) {
+        try { child.kill("SIGTERM"); } catch { /* race: already exited */ }
+      } else {
+        onAbort = () => {
+          try { child.kill("SIGTERM"); } catch { /* already exited */ }
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
     let stdout = "";
     let stderr = "";
     let outBuf = "";
@@ -66,13 +91,17 @@ export async function run(
       errBuf = flushLines(chunk, errBuf, onStderr);
     });
     child.on("close", (code) => {
+      if (typeof trackedPid === "number") registry.untrackRun(trackedPid);
+      if (onAbort && signal) signal.removeEventListener("abort", onAbort);
       if (outBuf && onStdout) onStdout(outBuf);
       if (errBuf && onStderr) onStderr(errBuf);
       resolve({ code, stdout, stderr });
     });
-    child.on("error", (e) =>
-      resolve({ code: 1, stdout, stderr: stderr + String(e) }),
-    );
+    child.on("error", (e) => {
+      if (typeof trackedPid === "number") registry.untrackRun(trackedPid);
+      if (onAbort && signal) signal.removeEventListener("abort", onAbort);
+      resolve({ code: 1, stdout, stderr: stderr + String(e) });
+    });
   });
 }
 
@@ -85,147 +114,49 @@ export async function sh(script: string, opts: RunOptions = {}): Promise<ExecRes
 }
 
 /**
- * Start a long-lived process in the background. Returns the PID so the caller
- * can kill it later. Streams stdout/stderr to the parent unless `detached`.
+ * Start a long-lived process in the background. Returns the child so the
+ * caller can read pid / wire .on('error').
+ *
+ * The `detached: true` + caller's `.unref()` keeps the child alive after the
+ * runner Node process exits. To make Stop able to clean it up, pass
+ * `serverName` so it lands in the ProcessRegistry; runner.stop() then signals
+ * the whole pgrp (`-shellPid`) and the entire subtree dies together —
+ * crucial when the actual port listener is several levels deep
+ * (sh → npm → node → workers).
  */
 export function spawnBackground(
   cmd: string,
   args: string[],
-  opts: SpawnOptions = {},
+  opts: SpawnOptions & { serverName?: string; port?: number | null } = {},
 ): ChildProcess {
-  return spawn(cmd, args, {
+  const { serverName, port, ...spawnOpts } = opts;
+  const child = spawn(cmd, args, {
     stdio: "ignore",
     detached: true,
-    ...opts,
+    ...spawnOpts,
   });
+  if (serverName && typeof child.pid === "number") {
+    registry.trackServer(serverName, {
+      shellPid: child.pid,
+      pgid: child.pid, // detached:true → child is its own pgrp leader
+      port: port ?? null,
+    });
+    // If the caller-spawned process exits on its own (crash, normal exit),
+    // make sure the registry forgets it so stop() doesn't try to signal a
+    // dead pid (mostly harmless, but ESRCH spam is noise).
+    child.once("exit", () => registry.untrackServer(serverName));
+  }
+  return child;
 }
 
 /**
- * Kill whatever process is bound to `port`. Discovery uses one `lsof` shell;
- * everything else uses `process.kill()` directly so the loop has no shell
- * spawn overhead and can't be wedged by a slow shell. The whole function has
- * a 7-second outer deadline — if processes are genuinely unkillable we give
- * up loudly instead of holding the graph hostage.
- *
- * Safe no-op if nothing is listening. Every step is reported via `log` so
- * the web-ui log panel shows which part is slow.
+ * Send a signal to a single pid. Best-effort; swallows ESRCH (already gone)
+ * and other errors. For port cleanup and Stop-driven cleanup prefer:
+ *   - `src/runtime/ports.ts` → `ensurePortFree(port)` (multi-pass + pgrp + verify)
+ *   - `src/runtime/registry.ts` → `registry.killAll()` (owns full lifecycle)
+ * This one-shot helper is only for callers that already know the pid and
+ * just need to ask it to exit (e.g. finalize's "kill backend on cleanup").
  */
-export async function killByPort(
-  port: number,
-  log: (line: string) => void = () => {},
-): Promise<void> {
-  const overall = (async () => {
-    log(`  killByPort(${port}) v2 — using process.kill, 7s outer cap`);
-    log(`  lsof -ti:${port}`);
-    let pids: number[] = [];
-    try {
-      const r = await withTimeout(
-        sh(`lsof -ti:${port} || true`),
-        2000,
-        `lsof -ti:${port}`,
-      );
-      pids = r.stdout
-        .trim()
-        .split(/\s+/)
-        .filter(Boolean)
-        .map((s) => Number(s))
-        .filter((n) => Number.isFinite(n) && n > 0);
-    } catch (e) {
-      log(`  lsof failed: ${(e as Error).message} — giving up kill`);
-      return;
-    }
-    if (pids.length === 0) {
-      log(`  no process on :${port}`);
-      return;
-    }
-    log(`  found pid${pids.length > 1 ? "s" : ""} ${pids.join(", ")} — SIGTERM`);
-
-    for (const pid of pids) {
-      try {
-        process.kill(pid, "SIGTERM");
-        log(`  SIGTERM ${pid}: sent`);
-      } catch (e) {
-        const code = (e as NodeJS.ErrnoException).code;
-        if (code === "ESRCH") {
-          log(`  SIGTERM ${pid}: already gone`);
-        } else if (code === "EPERM") {
-          log(`  SIGTERM ${pid}: permission denied (process not owned by us)`);
-        } else {
-          log(`  SIGTERM ${pid}: ${code ?? (e as Error).message}`);
-        }
-      }
-    }
-
-    // Poll every 100ms for up to 1s for graceful exit. process.kill(pid, 0)
-    // is a single syscall — no shell, no allocation.
-    const deadline = Date.now() + 1000;
-    let alive = pids;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 100));
-      alive = pids.filter(isAlive);
-      if (alive.length === 0) {
-        log(`  all pids exited gracefully`);
-        return;
-      }
-    }
-
-    log(`  ${alive.length} pid${alive.length > 1 ? "s" : ""} still alive — SIGKILL`);
-    for (const pid of alive) {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // already gone or permission denied — best-effort
-      }
-    }
-
-    // Brief settle window so the OS can release the port before the caller
-    // tries to bind it again. 200ms is plenty for the kernel to reap a
-    // SIGKILLed process and tear down its sockets.
-    await new Promise((r) => setTimeout(r, 200));
-    const stillAlive = pids.filter(isAlive);
-    if (stillAlive.length > 0) {
-      log(
-        `  WARNING: pid${stillAlive.length > 1 ? "s" : ""} ${stillAlive.join(", ")} survived SIGKILL — may need manual cleanup (\`kill -9 ${stillAlive.join(" ")}\`)`,
-      );
-    } else {
-      log(`  SIGKILL successful`);
-    }
-  })();
-
-  try {
-    await withTimeout(overall, 7000, `killByPort(${port})`);
-  } catch (e) {
-    log(`  killByPort timed out: ${(e as Error).message} — moving on`);
-  }
-}
-
-function withTimeout<T>(
-  promise: Promise<T>,
-  ms: number,
-  label: string,
-): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<never>((_, reject) =>
-      setTimeout(
-        () => reject(new Error(`${label} timed out after ${ms}ms`)),
-        ms,
-      ),
-    ),
-  ]);
-}
-
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    // EPERM means it exists but we can't signal it; still "alive" from our
-    // perspective so we don't loop forever waiting.
-    return (e as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
 export async function killPid(pid: number, signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
   try {
     process.kill(pid, signal);

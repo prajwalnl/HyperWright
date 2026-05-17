@@ -46,8 +46,16 @@ app.post("/api/workflow/start", async (c) => {
   // real 409 instead of staring at a silent UI. Other errors propagate via
   // the SSE `error` event.
   try {
-    if (runner.status().running) {
-      return c.json({ error: "A workflow is already running" }, 409);
+    const status = runner.status();
+    if (
+      status.runStatus === "running" ||
+      status.runStatus === "paused" ||
+      status.runStatus === "stopping"
+    ) {
+      return c.json(
+        { error: `A workflow is already ${status.runStatus}` },
+        409,
+      );
     }
     // Clamp heal-attempts to a sane range so a typo'd 0 doesn't skip healing
     // entirely and a typo'd 999 doesn't stall the run forever.
@@ -89,9 +97,14 @@ app.post("/api/workflow/resume", async (c) => {
   }
 });
 
-app.post("/api/workflow/stop", (c) => {
+app.post("/api/workflow/stop", async (c) => {
   try {
-    runner.stop();
+    // Fire-and-forget the await: the client subscribes via SSE for the
+    // `stopping` → `stopped` events. Returning ok immediately keeps the
+    // button responsive while cleanup unwinds.
+    void runner.stop().catch((err) => {
+      console.error("[runner.stop] failed:", err);
+    });
     return c.json({ ok: true });
   } catch (err) {
     return c.json({ error: (err as Error).message }, 500);
@@ -121,7 +134,7 @@ app.get("/api/workflow/stream", (c) => {
       //   3. terminal event (finished / stopped / error) if the workflow
       //      ended while the client was disconnected
       //   4. `awaiting_choice` if paused at HITL
-      if (status.running) {
+      if (status.runStatus === "running") {
         await writeEvent(sse, {
           type: "started",
           thread: status.threadId ?? status.snapshot.sessionId,
@@ -133,10 +146,15 @@ app.get("/api/workflow/stream", (c) => {
         currentNodes: status.currentNodes,
         nextNodes: status.nextNodes,
       });
-      if (!status.running && status.terminal) {
+      // Re-establish lifecycle on the new client: replay the most recent
+      // non-`running` runStatus so the UI can pick the right button states
+      // and reducer branch without inventing them.
+      if (status.runStatus === "stopping") {
+        await writeEvent(sse, { type: "stopping" });
+      } else if (status.terminal) {
         await writeEvent(sse, status.terminal);
       }
-      if (status.awaitingChoice) {
+      if (status.runStatus === "paused") {
         await writeEvent(sse, { type: "awaiting_choice" });
       }
     }

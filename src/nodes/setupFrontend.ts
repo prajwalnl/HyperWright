@@ -1,6 +1,7 @@
 import { ENV } from "../env.js";
-import { killByPort, run, spawnBackground } from "../runtime/exec.js";
-import { isReachable, waitUntilReachable } from "../runtime/http.js";
+import { run, spawnBackground } from "../runtime/exec.js";
+import { ensurePortFree } from "../runtime/ports.js";
+import { waitUntilReachable } from "../runtime/http.js";
 import { createNodeLogger, loggerFor } from "../session/log.js";
 import { respond } from "../session/respond.js";
 import type { QAStateType, QAStateUpdate } from "../state.js";
@@ -22,22 +23,27 @@ export async function setupFrontendNode(
   l(`[setup-frontend] Frontend URL: ${ENV.frontend.url}`);
   l(`[setup-frontend] Frontend port: ${ENV.frontend.port}`);
 
-  l(`[setup-frontend] Checking if frontend is already running...`);
+  l(`[setup-frontend] Ensuring port ${ENV.frontend.port} is free...`);
   // Each session may target a different PR / branch, so a frontend that's
   // already on :9000 is almost certainly stale code from a previous run.
-  // Always kill + reinstall + rebuild + restart so the dashboard reflects
-  // the current cloned working tree.
-  if (await isReachable(ENV.frontend.url)) {
-    l(`[setup-frontend] Port ${ENV.frontend.port} is occupied — killing stale frontend`);
-    await killByPort(ENV.frontend.port, stream);
-    l(`[setup-frontend] Killed process on port ${ENV.frontend.port}`);
-  } else {
-    l(`[setup-frontend] Port ${ENV.frontend.port} is free`);
-    // Belt-and-braces: a dead-but-bound process can still hold the port
-    // (crashed dev server that didn't free its socket). Try to free it
-    // anyway — killByPort is a no-op if nothing's actually there.
-    await killByPort(ENV.frontend.port, stream);
+  // ensurePortFree multi-pass + pgrp-signals defeats both crashed-but-bound
+  // sockets AND respawn wrappers (nodemon / concurrently); the old
+  // killByPort signalled one pid and never re-checked.
+  const portResult = await ensurePortFree(ENV.frontend.port, { log: stream });
+  if (!portResult.ok) {
+    l(
+      `[setup-frontend] ERROR: Could not free port ${ENV.frontend.port} after ${portResult.passes} passes`,
+    );
+    l(`[setup-frontend] ========================================`);
+    return respond(state, {
+      phase: "failed",
+      status: "failed",
+      error: `Port ${ENV.frontend.port} is still held after ${portResult.passes} kill passes`,
+      servers: { frontendUp: false, frontendWasStarted: false, frontendPid: null },
+      logs,
+    });
   }
+  l(`[setup-frontend] Port ${ENV.frontend.port} is free (took ${portResult.passes} pass(es))`);
 
   l(`[setup-frontend] Step 1/4: Installing npm dependencies...`);
   l(`[setup-frontend] Running: npm install`);
@@ -96,7 +102,14 @@ export async function setupFrontendNode(
 
   let child;
   try {
-    child = spawnBackground("sh", ["-c", `cd "${repoPath}" && ${ENV.frontend.startCmd}`]);
+    // serverName + port wire this into the ProcessRegistry, so runner.stop()
+    // can signal the entire pgrp (sh → npm → vite/webpack → workers) at once
+    // instead of relying on the next setupFrontend run to find the orphan.
+    child = spawnBackground(
+      "sh",
+      ["-c", `cd "${repoPath}" && ${ENV.frontend.startCmd}`],
+      { serverName: "frontend", port: ENV.frontend.port },
+    );
   } catch (spawnErr) {
     const msg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
     l(`[setup-frontend] ERROR: Failed to spawn frontend start command: ${msg}`);

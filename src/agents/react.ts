@@ -7,8 +7,8 @@ import {
 } from "@langchain/core/messages";
 import { createReactAgent } from "@langchain/langgraph/prebuilt";
 import type { StructuredToolInterface } from "@langchain/core/tools";
-import { ENV } from "../env.js";
 import { createLLM } from "../llm.js";
+import { combineSignals, getRuntimeSignal } from "../runtime/context.js";
 import { browserTools, closeBrowser } from "../tools/browser.js";
 import { fsTools } from "../tools/fs.js";
 
@@ -34,6 +34,11 @@ export interface AgentRunOptions {
    * it has no business navigating Chromium.
    */
   noBrowser?: boolean;
+  /**
+   * Per-call abort signal (e.g. a node-scoped timeout). Combined with the
+   * workflow-wide Stop signal so either source can interrupt the loop.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -41,7 +46,7 @@ export interface AgentRunOptions {
  * Playwright browser tools and returns the final message content string.
  */
 export async function runSubAgent(opts: AgentRunOptions): Promise<string> {
-  const useBrowser = ENV.enableBrowserTools && !opts.noBrowser;
+  const useBrowser = !opts.noBrowser;
   const tools: StructuredToolInterface[] = [
     ...fsTools,
     ...(useBrowser ? browserTools : []),
@@ -52,6 +57,15 @@ export async function runSubAgent(opts: AgentRunOptions): Promise<string> {
   const agent = createReactAgent({ llm: createLLM(), tools });
   try {
     const allMessages: BaseMessage[] = [];
+    // Pull the workflow-scoped abort signal so Stop can interrupt an
+    // in-flight LLM call (litellm) or tool execution. Without this the
+    // ReAct loop would happily complete the current call (sometimes 60s+)
+    // before the next iteration noticed the abort. If the caller supplied
+    // its own (e.g. a per-node timeout), combine the two so either source
+    // can fire.
+    const signal = opts.signal
+      ? combineSignals(opts.signal)
+      : getRuntimeSignal() ?? undefined;
     const stream = await agent.stream(
       {
         messages: [
@@ -62,6 +76,7 @@ export async function runSubAgent(opts: AgentRunOptions): Promise<string> {
       {
         recursionLimit: opts.recursionLimit ?? 1000,
         streamMode: "updates",
+        signal,
       },
     );
 

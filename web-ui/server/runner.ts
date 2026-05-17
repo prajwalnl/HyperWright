@@ -7,9 +7,11 @@ import { Command } from "@langchain/langgraph";
 import { buildGraph, type CompiledQAGraph } from "../../src/graph.js";
 import { readJson, writeJson } from "../../src/session/files.js";
 import { logger } from "../../src/session/logger.js";
+import { registry } from "../../src/runtime/registry.js";
+import { setRuntimeSignal } from "../../src/runtime/context.js";
 import type { QAStateType } from "../../src/state.js";
 import type { TargetType, UserChoice } from "../../src/types.js";
-import type { WorkflowEvent, WorkflowSnapshot } from "./types.js";
+import type { RunStatus, WorkflowEvent, WorkflowSnapshot } from "./types.js";
 import { glob } from "node:fs/promises";
 
 // Resolve workspace root for session discovery
@@ -38,8 +40,12 @@ class Runner extends EventEmitter {
   private currentNodes: string[] = [];
   private nextNodes: string[] = [];
   private logsByNode = new Map<string, string[]>();
-  private running = false;
-  private awaitingChoice = false;
+  /**
+   * Single source of truth for the runner's lifecycle. `running` /
+   * `awaitingChoice` in status() are derived from this. Mutated only by
+   * setRunStatus() so transitions and broadcasts stay in lock-step.
+   */
+  private runStatus: RunStatus = "idle";
   private terminal: TerminalEvent | null = null;
   private abortController: AbortController | null = null;
   /**
@@ -50,6 +56,22 @@ class Runner extends EventEmitter {
    * guard the old completion overwrites the new run's running/terminal flags.
    */
   private inflight: Promise<void> | null = null;
+  /**
+   * Resolves once the in-flight stop() has finished cleanup. Reset and a
+   * subsequent start() both await this so the window between "stop requested"
+   * and "stop completed" is observable (state = stopping) instead of racing.
+   */
+  private stopInflight: Promise<void> | null = null;
+
+  /**
+   * Transition runStatus. Centralised so derived flags / events stay in sync
+   * with the enum. Returns true if the state actually changed.
+   */
+  private setRunStatus(next: RunStatus): boolean {
+    if (this.runStatus === next) return false;
+    this.runStatus = next;
+    return true;
+  }
 
   constructor() {
     super();
@@ -64,6 +86,14 @@ class Runner extends EventEmitter {
       this.publish({ type: "log", node, line });
     });
     void this.loadLatestRun();
+    // Defensive boot sweep: if a previous runner-Node process exited or
+    // crashed while a backend/frontend was still running, the dev server is
+    // still bound to its port. Kill anything recorded in the most-recent
+    // session's servers.json before the next start() tries to take the port.
+    void registry.sweepStaleFromDisk(HYPERWRIGHT_WRKDIR, (line) =>
+      // eslint-disable-next-line no-console
+      console.log(line),
+    );
   }
 
   private getLogsPath(sessionId: string): string {
@@ -116,13 +146,20 @@ class Runner extends EventEmitter {
     this.logsByNode = new Map(Object.entries(logsData));
     this.currentNodes = [];
 
-    // Do not resurrect running/awaitingChoice from disk. Those flags describe
-    // a live in-process workflow; after a server restart no such workflow
-    // exists (no graph, no abortController), and flipping them to true would
-    // make /start throw 409 and /stop no-op forever.
+    // Do not resurrect running/paused from disk. Those describe a live
+    // in-process workflow; after a server restart no such workflow exists
+    // (no graph, no abortController), and flipping runStatus to running
+    // would make /start throw 409 and /stop no-op forever. Best we can
+    // infer from disk is the terminal outcome.
     if (sessionData) {
-      this.running = false;
-      this.awaitingChoice = false;
+      if (sessionData.status === "failed") {
+        this.setRunStatus("failed");
+      } else if (sessionData.status === "complete") {
+        this.setRunStatus("complete");
+      } else {
+        // in_progress on disk + no live runner → treat as stopped.
+        this.setRunStatus("stopped");
+      }
     }
   }
 
@@ -183,8 +220,18 @@ class Runner extends EventEmitter {
     }>(sessionPath);
 
     if (sessionData) {
-      this.running = sessionData.status === "in_progress";
-      this.awaitingChoice = sessionData.phase === "awaiting-user-choice";
+      // Same rule as loadRun(): never resurrect live flags from disk.
+      // sessionData.status tells us the most we can claim is the terminal
+      // outcome — anything "in_progress" really means "the previous run
+      // didn't finish cleanly", which from this runner's perspective is
+      // indistinguishable from `stopped`.
+      if (sessionData.status === "failed") {
+        this.setRunStatus("failed");
+      } else if (sessionData.status === "complete") {
+        this.setRunStatus("complete");
+      } else {
+        this.setRunStatus("stopped");
+      }
       this.lastSnapshot = {
         sessionId,
         rawInput: sessionData.rawInput || "",
@@ -221,6 +268,7 @@ class Runner extends EventEmitter {
   }
 
   status(): {
+    runStatus: RunStatus;
     running: boolean;
     awaitingChoice: boolean;
     snapshot: WorkflowSnapshot | null;
@@ -230,8 +278,9 @@ class Runner extends EventEmitter {
     threadId: string | null;
   } {
     return {
-      running: this.running,
-      awaitingChoice: this.awaitingChoice,
+      runStatus: this.runStatus,
+      running: this.runStatus === "running",
+      awaitingChoice: this.runStatus === "paused",
       snapshot: this.lastSnapshot,
       currentNodes: this.currentNodes,
       nextNodes: this.nextNodes,
@@ -249,10 +298,19 @@ class Runner extends EventEmitter {
     targetType?: TargetType,
     maxHealingAttempts?: number,
   ): Promise<void> {
-    if (this.running) throw new Error("A workflow is already running");
+    // Wait out an in-flight stop so a quick stop→start sequence doesn't race.
+    if (this.stopInflight) {
+      await this.stopInflight.catch(() => undefined);
+    }
+    if (
+      this.runStatus === "running" ||
+      this.runStatus === "paused" ||
+      this.runStatus === "stopping"
+    ) {
+      throw new Error(`A workflow is already ${this.runStatus}`);
+    }
 
-    this.running = true;
-    this.awaitingChoice = false;
+    this.setRunStatus("running");
     this.lastSnapshot = null;
     this.currentNodes = [];
     this.nextNodes = [];
@@ -260,6 +318,10 @@ class Runner extends EventEmitter {
     this.logsByNode.clear();
     const ac = new AbortController();
     this.abortController = ac;
+    // Publish the signal so node-internal HTTP / LLM / child-process helpers
+    // (`run`, `isReachable`, `runSubAgent`) can react to Stop without each
+    // node having to thread the signal through its own arguments.
+    setRuntimeSignal(ac.signal);
 
     const thread = randomUUID();
     this.threadId = thread;
@@ -297,7 +359,10 @@ class Runner extends EventEmitter {
       } catch (err) {
         this.handleStreamError(err, ac);
       } finally {
-        if (this.abortController === ac) this.abortController = null;
+        if (this.abortController === ac) {
+          this.abortController = null;
+          setRuntimeSignal(null);
+        }
       }
     })();
     this.inflight = work;
@@ -312,14 +377,16 @@ class Runner extends EventEmitter {
     if (!this.graph || !this.threadId) {
       throw new Error("No workflow active");
     }
-    if (!this.awaitingChoice) {
-      throw new Error("Workflow is not awaiting a user choice");
+    if (this.runStatus !== "paused") {
+      throw new Error(
+        `Workflow is not awaiting a user choice (status: ${this.runStatus})`,
+      );
     }
-    this.awaitingChoice = false;
     this.terminal = null;
-    this.running = true;
+    this.setRunStatus("running");
     const ac = new AbortController();
     this.abortController = ac;
+    setRuntimeSignal(ac.signal);
     const graph = this.graph;
     const config = {
       configurable: { thread_id: this.threadId },
@@ -336,7 +403,10 @@ class Runner extends EventEmitter {
       } catch (err) {
         this.handleStreamError(err, ac);
       } finally {
-        if (this.abortController === ac) this.abortController = null;
+        if (this.abortController === ac) {
+          this.abortController = null;
+          setRuntimeSignal(null);
+        }
       }
     })();
     this.inflight = work;
@@ -360,12 +430,16 @@ class Runner extends EventEmitter {
     // bail without mutating any of the new run's state.
     if (this.abortController !== ownAc) return;
     if (!this.graph) return;
+    // If stop() has already begun its transition to "stopping", do not
+    // overwrite that with "paused"/"complete" — stop() owns the terminal
+    // transition from here on.
+    if (this.runStatus === "stopping" || this.runStatus === "stopped") return;
     const state = await this.graph.getState(config);
     const next = state.next as string[];
     const hasInterrupts = state.tasks.some((t) => t.interrupts.length > 0);
 
     if (next.includes("finalize") || hasInterrupts) {
-      this.awaitingChoice = true;
+      this.setRunStatus("paused");
       this.nextNodes = next;
       this.publish({ type: "awaiting_choice" });
       return;
@@ -378,36 +452,89 @@ class Runner extends EventEmitter {
     // do not overwrite the new run's state with this old error.
     if (this.abortController !== ownAc) return;
     const errorMsg = (err as Error).message;
+    // Aborts are always caused by stop(): let stop()'s own transition own the
+    // terminal state. Real errors transition runStatus → failed here.
     if (errorMsg.match(/abort/i)) {
-      this.terminal = { type: "stopped" };
-      this.publish({ type: "stopped" });
-    } else {
-      this.terminal = { type: "error", message: errorMsg };
-      this.publish({ type: "error", message: errorMsg });
+      // stop() is in flight (or already transitioned us). Nothing to do.
+      this.nextNodes = [];
+      return;
     }
-    this.running = false;
+    this.terminal = { type: "error", message: errorMsg };
+    this.setRunStatus("failed");
+    this.publish({ type: "error", message: errorMsg });
     this.nextNodes = [];
   }
 
-  stop(): void {
-    if (this.abortController) {
-      this.abortController.abort();
+  /**
+   * Stop the workflow. Async because cleanup (graph abort + future child-
+   * process kills in Phase 2) isn't instantaneous; callers can `await` to
+   * know when "stopped" has actually been reached.
+   *
+   * Idempotent: noop in terminal/idle states. Concurrent stop() calls share
+   * the same `stopInflight` promise.
+   */
+  stop(): Promise<void> {
+    if (this.stopInflight) return this.stopInflight;
+    if (
+      this.runStatus === "idle" ||
+      this.runStatus === "stopped" ||
+      this.runStatus === "failed" ||
+      this.runStatus === "complete"
+    ) {
+      return Promise.resolve();
     }
+    const wasPaused = this.runStatus === "paused";
+    this.setRunStatus("stopping");
+    this.publish({ type: "stopping" });
+
+    this.stopInflight = (async () => {
+      try {
+        if (this.abortController) {
+          this.abortController.abort();
+        }
+        // If we were paused at HITL, the graph stream had already ended.
+        // No inflight to await — fall through to the terminal transition.
+        // Otherwise wait for the in-flight graph promise to settle so the
+        // abort actually unwinds before we declare us stopped.
+        if (!wasPaused && this.inflight) {
+          await Promise.race([
+            this.inflight.catch(() => undefined),
+            new Promise<void>((r) => setTimeout(r, 5000)),
+          ]);
+        }
+        // Kill every child process we own: long-lived servers (frontend/
+        // backend) via their pgrp, and any in-flight run() children
+        // (npm install / git clone / playwright test) by pid. Without this
+        // step, Stop only stops "reading the graph"; the actual subprocesses
+        // keep running and the next Start hits port-busy / lockfile-busy.
+        //
+        // Log lines go to console (server terminal) rather than the per-node
+        // logger because the "system" bucket isn't a selectable node in the
+        // graph; the user-facing signal for Stop is the runStatus transition
+        // (live → stopping → stopped) reflected in the badge.
+        await registry.killAll({
+          // eslint-disable-next-line no-console
+          log: (line) => console.log(line),
+          gracefulMs: 2000,
+        });
+      } finally {
+        this.currentNodes = [];
+        this.nextNodes = [];
+        this.terminal = { type: "stopped" };
+        this.setRunStatus("stopped");
+        this.publish({ type: "stopped" });
+        this.stopInflight = null;
+      }
+    })();
+    return this.stopInflight;
   }
 
+  /**
+   * Reset. Stops first if not already terminal, then wipes in-memory state
+   * and emits a `reset` event so the client can clear its UI.
+   */
   async clear(): Promise<void> {
-    this.stop();
-    // Wait for any in-flight start/resume to settle (it'll observe the abort
-    // and exit). Without this await, a subsequent start() races with the old
-    // run's teardown — the old run's handleStreamError fires AFTER the new
-    // run is up and corrupts state. Cap at 5s so a wedged run can't hang the
-    // server forever.
-    if (this.inflight) {
-      await Promise.race([
-        this.inflight.catch(() => undefined),
-        new Promise<void>((r) => setTimeout(r, 5000)),
-      ]);
-    }
+    await this.stop();
     logger.cleanup();
     this.threadId = null;
     this.graph = null;
@@ -416,10 +543,10 @@ class Runner extends EventEmitter {
     this.nextNodes = [];
     this.terminal = null;
     this.logsByNode.clear();
-    this.running = false;
-    this.awaitingChoice = false;
     this.abortController = null;
     this.inflight = null;
+    this.setRunStatus("idle");
+    this.publish({ type: "reset" });
   }
 
   private async consume(stream: AsyncIterable<unknown>): Promise<void> {
@@ -450,6 +577,10 @@ class Runner extends EventEmitter {
       // logs are persisted to disk in the correct location.
       if (state.sessionDir) {
         logger.initialize(state.sessionDir);
+        // Point the ProcessRegistry at the session so any tracked servers
+        // (frontend/backend) get persisted to servers.json — the recovery
+        // path on the next runner boot reads this.
+        registry.setSessionDir(state.sessionDir);
       }
 
       const nextNodes = snap.next as string[];
@@ -473,11 +604,11 @@ class Runner extends EventEmitter {
   // map via saveLogs() and does NOT re-emit anything.
 
   private finalise(): void {
-    this.running = false;
     this.currentNodes = [];
     this.nextNodes = [];
     const status = this.lastSnapshot?.status ?? "complete";
     this.terminal = { type: "finished", status };
+    this.setRunStatus(status === "failed" ? "failed" : "complete");
     this.publish({ type: "finished", status });
   }
 

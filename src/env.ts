@@ -58,7 +58,6 @@ export const ENV = {
     pageObjectsDir: opt("PAGE_OBJECTS_DIR", "playwright-tests/support/pages"),
   },
   playwrightPassword: opt("PLAYWRIGHT_PASSWORD", "Test@123456"),
-  enableBrowserTools: opt("ENABLE_BROWSER_TOOLS", "1") === "1",
 };
 
 export function maskedEnvSummary(): string {
@@ -70,6 +69,5 @@ export function maskedEnvSummary(): string {
     `litellm.apiKey=${mask(ENV.litellm.apiKey)}`,
     `backend=${ENV.backend.healthUrl}`,
     `frontend=${ENV.frontend.url}`,
-    `enableBrowserTools=${ENV.enableBrowserTools}`,
   ].join(" | ");
 }

@@ -4,6 +4,7 @@ import type {
   WorkflowEvent,
   WorkflowSnapshot,
 } from "../types.js";
+import type { RunStatus } from "../../server/types.js";
 import type { UserChoice } from "../../../src/types.js";
 
 const STORAGE_KEY = "qa-workflow-state-v1";
@@ -14,11 +15,8 @@ interface PersistedState {
   nextNodes: string[];
   visitedNodes: string[];
   logsByNode: Array<[string, string[]]>;
-  awaitingChoice: boolean;
-  finished: boolean;
-  stopped: boolean;
+  runStatus: RunStatus;
   error: string | null;
-  running: boolean;
 }
 
 function serializeState(state: WorkflowState): PersistedState {
@@ -28,30 +26,32 @@ function serializeState(state: WorkflowState): PersistedState {
     nextNodes: Array.from(state.nextNodes),
     visitedNodes: Array.from(state.visitedNodes),
     logsByNode: Array.from(state.logsByNode.entries()),
-    awaitingChoice: state.awaitingChoice,
-    finished: state.finished,
-    stopped: state.stopped,
+    runStatus: state.runStatus,
     error: state.error,
-    running: state.running,
   };
 }
 
 function deserializeState(persisted: PersistedState): WorkflowState {
+  // Live runStatus values (running / paused / stopping) describe an
+  // in-process server workflow. After a page reload no such workflow exists
+  // from the client's perspective; the SSE replay will re-emit the actual
+  // current status if it's still live. So we collapse those to "stopped" /
+  // "idle" pending the server's word.
+  const persistedStatus = persisted.runStatus ?? "idle";
+  const status: RunStatus =
+    persistedStatus === "running" ||
+    persistedStatus === "paused" ||
+    persistedStatus === "stopping"
+      ? "stopped"
+      : persistedStatus;
   return {
     snapshot: persisted.snapshot,
     currentNodes: new Set(persisted.currentNodes),
     nextNodes: new Set(persisted.nextNodes),
     visitedNodes: new Set(persisted.visitedNodes),
     logsByNode: new Map(persisted.logsByNode),
-    // running/awaitingChoice are live runtime flags — never restore them from
-    // localStorage, or a page reload will lock the UI into a stale state
-    // that nothing can clear. The SSE replay re-emits them if the server
-    // is still actually paused.
-    awaitingChoice: false,
-    finished: persisted.finished,
-    stopped: persisted.stopped ?? false,
+    runStatus: status,
     error: persisted.error,
-    running: false,
   };
 }
 
@@ -79,11 +79,14 @@ export interface WorkflowState {
   nextNodes: Set<string>;
   visitedNodes: Set<string>;
   logsByNode: Map<string, string[]>;
-  awaitingChoice: boolean;
-  finished: boolean;
-  stopped: boolean;
+  /**
+   * Source of truth for the runner lifecycle on the client. All button
+   * enablement and badge labels derive from this; the old `running`,
+   * `finished`, `stopped`, `awaitingChoice` booleans are computed properties
+   * on top of it (see `deriveFlags` in App.tsx).
+   */
+  runStatus: RunStatus;
   error: string | null;
-  running: boolean;
 }
 
 // Map each phase to ONLY the nodes that are guaranteed to have run once that
@@ -112,11 +115,8 @@ const INITIAL_STATE: WorkflowState = {
   nextNodes: new Set(),
   visitedNodes: new Set(),
   logsByNode: new Map(),
-  awaitingChoice: false,
-  finished: false,
-  stopped: false,
+  runStatus: "idle",
   error: null,
-  running: false,
 };
 
 export function useWorkflow(): {
@@ -151,8 +151,10 @@ export function useWorkflow(): {
       "state",
       "log",
       "awaiting_choice",
+      "stopping",
       "finished",
       "stopped",
+      "reset",
       "error",
     ]) {
       es.addEventListener(t, handler);
@@ -162,9 +164,14 @@ export function useWorkflow(): {
   }, []);
 
   const start = useCallback(async (req: StartRequest) => {
+    // Seed nextNodes with setupContext so the graph shows it as "running"
+    // immediately. The server's first `state` event only fires once
+    // setupContext *completes*, so without this seed the first node would
+    // sit idle until done, then jump straight to green.
     setState(() => ({
       ...INITIAL_STATE,
-      running: true,
+      runStatus: "running",
+      nextNodes: new Set(["setupContext"]),
     }));
     const res = await fetch("/api/workflow/start", {
       method: "POST",
@@ -175,7 +182,7 @@ export function useWorkflow(): {
       const body = (await res.json().catch(() => ({}))) as { error?: string };
       setState((prev) => ({
         ...prev,
-        running: false,
+        runStatus: "failed",
         error: body.error ?? `HTTP ${res.status}`,
       }));
     }
@@ -209,10 +216,8 @@ function reduce(prev: WorkflowState, evt: WorkflowEvent): WorkflowState {
     case "started":
       return {
         ...prev,
-        running: true,
-        finished: false,
+        runStatus: "running",
         error: null,
-        awaitingChoice: false,
       };
     case "state": {
       const current = new Set(evt.currentNodes);
@@ -237,27 +242,30 @@ function reduce(prev: WorkflowState, evt: WorkflowEvent): WorkflowState {
       return { ...prev, logsByNode: logs };
     }
     case "awaiting_choice":
-      return { ...prev, awaitingChoice: true };
+      return { ...prev, runStatus: "paused" };
+    case "stopping":
+      return { ...prev, runStatus: "stopping" };
     case "finished":
       return {
         ...prev,
-        running: false,
-        finished: true,
+        runStatus: evt.status === "failed" ? "failed" : "complete",
         currentNodes: new Set(),
         nextNodes: new Set(),
-        awaitingChoice: false,
       };
     case "stopped":
       return {
         ...prev,
-        running: false,
-        stopped: true,
+        runStatus: "stopped",
         currentNodes: new Set(),
         nextNodes: new Set(),
-        awaitingChoice: false,
       };
+    case "reset":
+      // Server-initiated reset (rare — usually the client drives it via the
+      // reset callback, which also clears localStorage). When it does arrive,
+      // collapse to the initial state.
+      return { ...INITIAL_STATE };
     case "error":
-      return { ...prev, error: evt.message, running: false };
+      return { ...prev, error: evt.message, runStatus: "failed" };
     default:
       return prev;
   }

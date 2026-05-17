@@ -10,6 +10,29 @@ import type {
   UserChoice,
 } from "../../src/types.js";
 
+/**
+ * Runner lifecycle (distinct from the workflow's overall `Status`).
+ *
+ *   idle      — no workflow loaded; only Start is meaningful
+ *   running   — graph stream is actively producing
+ *   paused    — graph hit a HITL interrupt; awaiting user choice
+ *   stopping  — Stop received; abort + cleanup in flight
+ *   stopped   — Stop completed; terminal until Reset
+ *   failed    — graph errored; terminal until Reset
+ *   complete  — graph finished successfully; terminal until Reset
+ *
+ * Start is rejected unless runStatus ∈ {idle, stopped, failed, complete}.
+ * Reset is allowed from any state; if non-terminal it stops first.
+ */
+export type RunStatus =
+  | "idle"
+  | "running"
+  | "paused"
+  | "stopping"
+  | "stopped"
+  | "failed"
+  | "complete";
+
 /** One snapshot of the graph state, serialised for the client. */
 export interface WorkflowSnapshot {
   sessionId: string;
@@ -43,8 +66,14 @@ export type WorkflowEvent =
   | { type: "state"; snapshot: WorkflowSnapshot; currentNodes: string[]; nextNodes: string[] }
   | { type: "log"; node: string; line: string }
   | { type: "awaiting_choice" }
+  /**
+   * Emitted as soon as stop() begins, before kills/cleanup finish. UI shows a
+   * "stopping…" spinner; Start stays disabled until `stopped` arrives.
+   */
+  | { type: "stopping" }
   | { type: "finished"; status: Status }
   | { type: "stopped" }
+  | { type: "reset" }
   | { type: "error"; message: string };
 
 export interface StartRequest {

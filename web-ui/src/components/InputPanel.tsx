@@ -2,9 +2,12 @@ import { useState } from "react";
 import type { TargetType } from "../../../src/types.js";
 
 export interface InputPanelProps {
-  disabled: boolean;
+  /** True when Start cannot be invoked: running / paused / stopping. */
+  startDisabled: boolean;
   canStop?: boolean;
   canReset?: boolean;
+  /** While true, Stop is disabled and labelled "stopping…". */
+  isStopping?: boolean;
   onStart: (
     input: string,
     targetType: TargetType | undefined,
@@ -27,9 +30,10 @@ const HINTS: Record<TargetType | "auto", string> = {
 };
 
 export function InputPanel({
-  disabled,
+  startDisabled,
   canStop,
   canReset,
+  isStopping,
   onStart,
   onStop,
   onReset,
@@ -68,7 +72,7 @@ export function InputPanel({
         <select
           id="kind"
           value={kind}
-          disabled={disabled}
+          disabled={startDisabled}
           onChange={(e) => setKind(e.target.value as typeof kind)}
         >
           <option value="auto">auto-detect from message</option>
@@ -85,7 +89,7 @@ export function InputPanel({
           id="raw"
           rows={3}
           value={raw}
-          disabled={disabled}
+          disabled={startDisabled}
           placeholder={HINTS[kind]}
           onChange={(e) => setRaw(e.target.value)}
           style={{ resize: "vertical" }}
@@ -103,7 +107,7 @@ export function InputPanel({
           max={MAX_HEAL_ATTEMPTS}
           step={1}
           value={healAttempts}
-          disabled={disabled}
+          disabled={startDisabled}
           onChange={(e) => {
             const n = Number(e.target.value);
             setHealAttempts(Number.isFinite(n) ? n : DEFAULT_HEAL_ATTEMPTS);
@@ -115,19 +119,20 @@ export function InputPanel({
       <div style={{ display: "flex", gap: 8 }}>
         <button
           className="primary"
-          disabled={disabled || !raw.trim()}
+          disabled={startDisabled || !raw.trim()}
           onClick={handleStart}
           style={{ flex: 1 }}
         >
-          {disabled ? "Running…" : "Start workflow"}
+          {startDisabled ? "Running…" : "Start workflow"}
         </button>
         {canStop && onStop && (
           <button
             className="danger"
+            disabled={!!isStopping}
             onClick={onStop}
             title="Stop the running workflow"
           >
-            Stop
+            {isStopping ? "Stopping…" : "Stop"}
           </button>
         )}
         {canReset && onReset && (

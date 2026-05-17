@@ -31,7 +31,12 @@ export async function setupBackendNode(
 
     let child;
     try {
-      child = spawnBackground("sh", [ENV.backend.startScript], { cwd: repoPath });
+      // serverName lands this in the ProcessRegistry so Stop kills the whole
+      // backend pgrp (start_hyperswitch.sh → cargo → server) at once.
+      child = spawnBackground("sh", [ENV.backend.startScript], {
+        cwd: repoPath,
+        serverName: "backend",
+      });
     } catch (spawnErr) {
       const msg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
       l(`[setup-backend] ERROR: Failed to spawn backend start script: ${msg}`);
