@@ -22,10 +22,11 @@ const HYPERWRIGHT_WRKDIR = path.join(WORKSPACE_ROOT, "hyperwright-wrkdir");
 
 /**
  * Compute the session directory path based on sessionId.
- * Sessions are stored in hyperwright-wrkdir/hcc-{sessionId}/cloned-repo/.ai-test-gen/
+ * Sessions are stored in hyperwright-wrkdir/hcc-{sessionId}/.ai-test-gen/
+ * (sibling of cloned-repo, so artifacts stay out of the working tree).
  */
 function getSessionDir(sessionId: string): string {
-  return path.join(HYPERWRIGHT_WRKDIR, `hcc-${sessionId}`, "cloned-repo", ".ai-test-gen");
+  return path.join(HYPERWRIGHT_WRKDIR, `hcc-${sessionId}`, ".ai-test-gen");
 }
 
 type TerminalEvent =
@@ -111,7 +112,7 @@ class Runner extends EventEmitter {
     const sessions: Array<{ sessionId: string; mtime: Date }> = [];
 
     try {
-      for await (const entry of glob("hcc-*/cloned-repo/.ai-test-gen/web-ui-logs.json", { cwd: HYPERWRIGHT_WRKDIR, withFileTypes: true })) {
+      for await (const entry of glob("hcc-*/.ai-test-gen/web-ui-logs.json", { cwd: HYPERWRIGHT_WRKDIR, withFileTypes: true })) {
         if (entry.isFile()) {
           const parts = entry.parentPath.split("/");
           const hccDir = parts.find((p) => p.startsWith("hcc-"));
@@ -167,7 +168,7 @@ class Runner extends EventEmitter {
     const sessions: Array<{ threadId: string; startedAt: string; status: string; mtime: Date }> = [];
 
     try {
-      for await (const entry of glob("hcc-*/cloned-repo/.ai-test-gen/session.json", { cwd: HYPERWRIGHT_WRKDIR, withFileTypes: true })) {
+      for await (const entry of glob("hcc-*/.ai-test-gen/session.json", { cwd: HYPERWRIGHT_WRKDIR, withFileTypes: true })) {
         if (entry.isFile()) {
           const parts = entry.parentPath.split("/");
           const hccDir = parts.find((p) => p.startsWith("hcc-"));
@@ -328,9 +329,9 @@ class Runner extends EventEmitter {
     this.graph = buildGraph();
     const graph = this.graph;
 
-    // sessionDir is computed by setupContext (inside cloned-repo/.ai-test-gen).
-    // Logger is initialized lazily when consume() sees the first state update
-    // that carries sessionDir.
+    // sessionDir is computed by setupContext (hcc-<id>/.ai-test-gen, sibling
+    // of cloned-repo). Logger is initialized lazily when consume() sees the
+    // first state update that carries sessionDir.
 
     const init: Partial<QAStateType> = {
       rawInput,

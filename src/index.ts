@@ -11,7 +11,7 @@ import type { UserChoice } from "./types.js";
  * Both choices are terminal — after `finalize` the graph runs `summary`
  * and ends.
  *
- * Artifacts land in hyperwright-wrkdir/hcc-{sessionId}/cloned-repo/.ai-test-gen/
+ * Artifacts land in hyperwright-wrkdir/hcc-{sessionId}/.ai-test-gen/
  * Generated tests go to hyperwright-wrkdir/hcc-{sessionId}/cloned-repo/playwright-tests/ai-generated/
  */
 const VALID_CHOICES: UserChoice[] = ["commit-push", "cleanup"];
@@ -51,7 +51,7 @@ async function main() {
     printLogs(first.logs);
   }
   console.log(`\nSession ID: ${threadId}`);
-  console.log(`Artifacts in: hyperwright-wrkdir/hcc-${threadId}/cloned-repo/.ai-test-gen/`);
+  console.log(`Artifacts in: hyperwright-wrkdir/hcc-${threadId}/.ai-test-gen/`);
 }
 
 function printLogs(logs: string[]) {

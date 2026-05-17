@@ -77,61 +77,20 @@ function savePlanTool(cfg: PlannerToolsConfig): StructuredToolInterface {
 function authSetupTool(cfg: PlannerToolsConfig): StructuredToolInterface {
   return tool(
     async ({ targetPath, email, password, skipAuth }) => {
-      const base = cfg.baseUrl ?? DASHBOARD_BASE_URL;
-      const page = await ensurePage();
-      const log: string[] = [];
-
-      if (skipAuth) {
-        const url = base + (targetPath ?? "/dashboard/home");
-        await page.goto(url, { waitUntil: "networkidle", timeout: 30_000 });
-        return `navigated (auth skipped) → ${page.url()}`;
-      }
-
-      // If the session already has creds (signup happened in setupJoin), reuse
-      // them and skip the signup roundtrip — that user already exists. Agent-
-      // provided overrides still win.
-      const sessionCreds = cfg.creds ?? null;
-      const reuseSession =
-        !email && !password && sessionCreds !== null;
-      const creds = reuseSession
-        ? sessionCreds!
-        : {
-            email:
-              email ??
-              `test_${Date.now()}_${randomUUID().slice(0, 8)}@example.com`,
-            password: password ?? ENV.playwrightPassword,
-          };
-
-      try {
-        await logoutIfLoggedIn(page, base, log);
-        if (!reuseSession) {
-          log.push(await signupUser(creds));
-        } else {
-          log.push(`reusing session creds (${creds.email}) — skipping signup`);
-        }
-        log.push(await loginUI(page, base, creds));
-        log.push(await skipTwoFactor(page));
-        if (targetPath) {
-          await page.goto(base + targetPath, {
-            waitUntil: "networkidle",
-            timeout: 30_000,
-          });
-          log.push(`navigated → ${page.url()}`);
-        } else {
-          log.push(`landed → ${page.url()}`);
-        }
-        log.push(`credentials: ${creds.email}`);
-        return log.join("\n");
-      } catch (err) {
-        log.push(`ERROR: ${(err as Error).message}`);
-        log.push(`current URL: ${page.url()}`);
-        return log.join("\n");
-      }
+      const lines = await performAuthSetup({
+        targetPath,
+        email,
+        password,
+        skipAuth,
+        creds: cfg.creds ?? null,
+        baseUrl: cfg.baseUrl ?? DASHBOARD_BASE_URL,
+      });
+      return lines.join("\n");
     },
     {
       name: "planner_setup_page",
       description:
-        "Run the full auth flow (signup_with_merchant_id → /dashboard/login → Continue → Skip 2FA → targetPath). Handles already-logged-in state by logging out first. Returns a step-by-step diagnostic log. Call this ONCE at the start of exploration — do NOT stitch login steps with browser_* tools manually.",
+        "Re-run the auth flow if the page has been invalidated (signed out, session expired). The orchestrator already calls this once before invoking the agent, so under normal circumstances you do NOT need to call it. If you do call it, the flow is: signup_with_merchant_id → /dashboard/login → Continue → Skip 2FA → targetPath.",
       schema: z.object({
         targetPath: z
           .string()
@@ -146,6 +105,85 @@ function authSetupTool(cfg: PlannerToolsConfig): StructuredToolInterface {
       }),
     },
   );
+}
+
+interface PerformAuthSetupOpts {
+  targetPath?: string;
+  email?: string;
+  password?: string;
+  skipAuth?: boolean;
+  creds: Creds | null;
+  baseUrl?: string;
+}
+
+/**
+ * Deterministic auth flow, reusable from both the LLM tool wrapper above and
+ * directly from the planTests node (which lifts the call out of the agent so
+ * the agent can't accidentally skip or re-order it). Returns a per-step log
+ * the caller can fold into its own logger.
+ */
+export async function performAuthSetup(
+  opts: PerformAuthSetupOpts,
+): Promise<string[]> {
+  const base = opts.baseUrl ?? DASHBOARD_BASE_URL;
+  const page = await ensurePage();
+  const log: string[] = [];
+
+  if (opts.skipAuth) {
+    const url = base + (opts.targetPath ?? "/dashboard/home");
+    await page.goto(url, { waitUntil: "networkidle", timeout: 30_000 });
+    log.push(`navigated (auth skipped) → ${page.url()}`);
+    return log;
+  }
+
+  const reuseSession =
+    !opts.email && !opts.password && opts.creds !== null;
+  const creds = reuseSession
+    ? opts.creds!
+    : {
+        email:
+          opts.email ??
+          `test_${Date.now()}_${randomUUID().slice(0, 8)}@example.com`,
+        password: opts.password ?? ENV.playwrightPassword,
+      };
+
+  try {
+    await logoutIfLoggedIn(page, base, log);
+    if (!reuseSession) {
+      log.push(await signupUser(creds));
+    } else {
+      log.push(`reusing session creds (${creds.email}) — skipping signup`);
+    }
+    log.push(await loginUI(page, base, creds));
+    log.push(await skipTwoFactor(page));
+    if (opts.targetPath) {
+      await page.goto(base + opts.targetPath, {
+        waitUntil: "networkidle",
+        timeout: 30_000,
+      });
+      log.push(`navigated → ${page.url()}`);
+    } else {
+      log.push(`landed → ${page.url()}`);
+    }
+    log.push(`credentials: ${creds.email}`);
+    return log;
+  } catch (err) {
+    log.push(`ERROR: ${(err as Error).message}`);
+    log.push(`current URL: ${page.url()}`);
+    throw new AuthSetupError((err as Error).message, log);
+  }
+}
+
+/**
+ * Wraps an auth-setup failure with the step-by-step log already gathered,
+ * so the caller (planTestsNode) can surface the full trail rather than just
+ * the final error.message.
+ */
+export class AuthSetupError extends Error {
+  constructor(message: string, public readonly steps: string[]) {
+    super(message);
+    this.name = "AuthSetupError";
+  }
 }
 
 // --- Auth-flow helpers ------------------------------------------------------

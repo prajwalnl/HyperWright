@@ -1,6 +1,7 @@
 import { ENV } from "../env.js";
 import { spawnBackground } from "../runtime/exec.js";
 import { isReachable, waitUntilReachable } from "../runtime/http.js";
+import { abortSetupPhase } from "../runtime/setupPhase.js";
 import { loggerFor } from "../session/log.js";
 import { respond } from "../session/respond.js";
 import type { QAStateType, QAStateUpdate } from "../state.js";
@@ -40,6 +41,7 @@ export async function setupBackendNode(
     } catch (spawnErr) {
       const msg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
       l(`[setup-backend] ERROR: Failed to spawn backend start script: ${msg}`);
+      abortSetupPhase("backend spawn failed");
       l(`[setup-backend] ========================================`);
       return respond(state, {
         phase: "failed",
@@ -77,6 +79,7 @@ export async function setupBackendNode(
       l(`[setup-backend] Killing backend process ${backendPid}...`);
       try { process.kill(backendPid); } catch { /* already gone */ }
     }
+    abortSetupPhase("backend setup failed");
     l(`[setup-backend] ========================================`);
     return respond(state, {
       phase: "failed",

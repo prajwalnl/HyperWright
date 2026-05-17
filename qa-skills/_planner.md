@@ -125,18 +125,15 @@ Use module dependency mapping from SKILL.md:
 
 ### 3.4: Explore Application (Browser Tools REQUIRED)
 
-Use authentication flow from SKILL.md to log in (Create test user with `signup_with_merchant_id` API, login, skip 2FA, and navigate to the target module/feature), then:
-
-- Navigate to login page
-- If already in `dashboard/home` → logout via UI
-- Create a test user via `signup_with_merchant_id` API
-- Handle 2FA screen by clicking on skip button
+**Auth is already done by the orchestrator.** When you start, the browser is
+already signed in and sitting on the target module page. You do NOT need to
+log in, navigate to /dashboard/login, skip 2FA, or call `planner_setup_page`.
+That tool exists only as a recovery hatch if the page is later invalidated
+(e.g. you're bounced to /dashboard/login mid-exploration). Don't pre-emptively
+re-authenticate.
 
 ```typescript
-// Navigate to target module
-await browser_navigate({ url: "http://localhost:9000/dashboard/{module}" });
-
-// Capture page structure
+// You're already on /dashboard/{module}. Snapshot first to see what's there.
 const snapshot = await browser_snapshot({});
 ```
 

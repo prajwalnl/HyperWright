@@ -2,9 +2,15 @@ import { ENV } from "../env.js";
 import { run, spawnBackground } from "../runtime/exec.js";
 import { ensurePortFree } from "../runtime/ports.js";
 import { waitUntilReachable } from "../runtime/http.js";
+import {
+  abortSetupPhase,
+  setupPhaseSignal,
+  throwIfSetupAborted,
+} from "../runtime/setupPhase.js";
 import { createNodeLogger, loggerFor } from "../session/log.js";
 import { respond } from "../session/respond.js";
 import type { QAStateType, QAStateUpdate } from "../state.js";
+import type { Servers } from "../types.js";
 
 export async function setupFrontendNode(
   state: QAStateType,
@@ -23,6 +29,27 @@ export async function setupFrontendNode(
   l(`[setup-frontend] Frontend URL: ${ENV.frontend.url}`);
   l(`[setup-frontend] Frontend port: ${ENV.frontend.port}`);
 
+  // Helper: most of setupFrontend's failure paths look the same. Centralize
+  // the "abort the sibling + return failed" boilerplate so we don't drift.
+  const fail = async (
+    error: string,
+    serverPatch: Partial<Servers> = { frontendUp: false, frontendWasStarted: false, frontendPid: null },
+  ): Promise<QAStateUpdate> => {
+    abortSetupPhase("frontend setup failed");
+    l(`[setup-frontend] ========================================`);
+    return respond(state, {
+      phase: "failed",
+      status: "failed",
+      error,
+      servers: serverPatch,
+      logs,
+    });
+  };
+
+  // Per-call signal so a backend failure SIGTERMs the in-flight npm install /
+  // build instead of letting them grind to completion before setupJoin notices.
+  const phaseSignal = setupPhaseSignal() ?? undefined;
+
   l(`[setup-frontend] Ensuring port ${ENV.frontend.port} is free...`);
   // Each session may target a different PR / branch, so a frontend that's
   // already on :9000 is almost certainly stale code from a previous run.
@@ -31,19 +58,15 @@ export async function setupFrontendNode(
   // killByPort signalled one pid and never re-checked.
   const portResult = await ensurePortFree(ENV.frontend.port, { log: stream });
   if (!portResult.ok) {
-    l(
-      `[setup-frontend] ERROR: Could not free port ${ENV.frontend.port} after ${portResult.passes} passes`,
-    );
-    l(`[setup-frontend] ========================================`);
-    return respond(state, {
-      phase: "failed",
-      status: "failed",
-      error: `Port ${ENV.frontend.port} is still held after ${portResult.passes} kill passes`,
-      servers: { frontendUp: false, frontendWasStarted: false, frontendPid: null },
-      logs,
-    });
+    l(`[setup-frontend] ERROR: Could not free port ${ENV.frontend.port} after ${portResult.passes} passes`);
+    return fail(`Port ${ENV.frontend.port} is still held after ${portResult.passes} kill passes`);
   }
   l(`[setup-frontend] Port ${ENV.frontend.port} is free (took ${portResult.passes} pass(es))`);
+
+  try { throwIfSetupAborted(); } catch (e) {
+    l(`[setup-frontend] aborted by sibling: ${(e as Error).message}`);
+    return respond(state, { phase: "failed", status: "failed", error: (e as Error).message, logs });
+  }
 
   l(`[setup-frontend] Step 1/4: Installing npm dependencies...`);
   l(`[setup-frontend] Running: npm install`);
@@ -53,21 +76,23 @@ export async function setupFrontendNode(
     {
       onStdout: (line) => stream(`  npm install: ${line}`),
       onStderr: (line) => stream(`  npm install: ${line}`),
+      signal: phaseSignal,
     },
   );
   l(`[setup-frontend] npm install exited with code: ${install.code}`);
 
+  // The signal-fired path produces a non-zero exit because run() SIGTERMs the
+  // child. Distinguish "sibling aborted us" from "npm install genuinely failed".
+  if (phaseSignal?.aborted) {
+    const reason = (phaseSignal.reason as Error | undefined)?.message ?? "aborted by sibling";
+    l(`[setup-frontend] aborted mid-install: ${reason}`);
+    return respond(state, { phase: "failed", status: "failed", error: reason, logs });
+  }
+
   if (install.code !== 0) {
     l(`[setup-frontend] ERROR: npm install failed`);
     l(`[setup-frontend] Stderr: ${install.stderr.slice(0, 500)}`);
-    l(`[setup-frontend] ========================================`);
-    return respond(state, {
-      phase: "failed",
-      status: "failed",
-      error: `npm install failed (exit ${install.code})`,
-      servers: { frontendUp: false, frontendWasStarted: false, frontendPid: null },
-      logs,
-    });
+    return fail(`npm install failed (exit ${install.code})`);
   }
   l(`[setup-frontend] npm install completed successfully`);
 
@@ -79,23 +104,28 @@ export async function setupFrontendNode(
     {
       onStdout: (line) => stream(`  build: ${line}`),
       onStderr: (line) => stream(`  build: ${line}`),
+      signal: phaseSignal,
     },
   );
   l(`[setup-frontend] Build exited with code: ${build.code}`);
 
+  if (phaseSignal?.aborted) {
+    const reason = (phaseSignal.reason as Error | undefined)?.message ?? "aborted by sibling";
+    l(`[setup-frontend] aborted mid-build: ${reason}`);
+    return respond(state, { phase: "failed", status: "failed", error: reason, logs });
+  }
+
   if (build.code !== 0) {
     l(`[setup-frontend] ERROR: Frontend build failed`);
     l(`[setup-frontend] Stderr: ${build.stderr.slice(0, 500)}`);
-    l(`[setup-frontend] ========================================`);
-    return respond(state, {
-      phase: "failed",
-      status: "failed",
-      error: `Frontend build failed (exit ${build.code})`,
-      servers: { frontendUp: false, frontendWasStarted: false, frontendPid: null },
-      logs,
-    });
+    return fail(`Frontend build failed (exit ${build.code})`);
   }
   l(`[setup-frontend] Frontend build completed successfully`);
+
+  try { throwIfSetupAborted(); } catch (e) {
+    l(`[setup-frontend] aborted by sibling: ${(e as Error).message}`);
+    return respond(state, { phase: "failed", status: "failed", error: (e as Error).message, logs });
+  }
 
   l(`[setup-frontend] Step 3/4: Starting frontend server...`);
   l(`[setup-frontend] Start command: ${ENV.frontend.startCmd}`);
@@ -113,14 +143,7 @@ export async function setupFrontendNode(
   } catch (spawnErr) {
     const msg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr);
     l(`[setup-frontend] ERROR: Failed to spawn frontend start command: ${msg}`);
-    l(`[setup-frontend] ========================================`);
-    return respond(state, {
-      phase: "failed",
-      status: "failed",
-      error: `Failed to spawn frontend: ${msg}`,
-      servers: { frontendUp: false, frontendWasStarted: false, frontendPid: null },
-      logs,
-    });
+    return fail(`Failed to spawn frontend: ${msg}`);
   }
 
   // Listen for immediate spawn errors (e.g., command not found)
@@ -146,14 +169,10 @@ export async function setupFrontendNode(
       l(`[setup-frontend] Killing frontend process ${frontendPid}...`);
       try { process.kill(frontendPid); } catch { /* already gone */ }
     }
-    l(`[setup-frontend] ========================================`);
-    return respond(state, {
-      phase: "failed",
-      status: "failed",
-      error: `Frontend did not come up at ${ENV.frontend.url}`,
-      servers: { frontendUp: false, frontendWasStarted: true, frontendPid },
-      logs,
-    });
+    return fail(
+      `Frontend did not come up at ${ENV.frontend.url}`,
+      { frontendUp: false, frontendWasStarted: true, frontendPid },
+    );
   }
 
   l(`[setup-frontend] Frontend is UP and reachable at ${ENV.frontend.url}`);

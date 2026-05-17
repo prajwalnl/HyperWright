@@ -63,10 +63,11 @@ export async function setupJoinNode(
   l(`[setup-join] NODE COMPLETE`);
   l(`[setup-join] ========================================`);
 
+  // Phase stays "setup" (set by setupContext); no need to re-write it and
+  // no need to re-append "setup" to phaseHistory — that produces duplicate
+  // entries via the appendArray reducer.
   return respond(state, {
     creds,
-    phase: "setup",
-    phaseHistory: ["setup"],
     logs,
   });
 }

@@ -2,7 +2,7 @@ import path from "node:path";
 import { extractJsonObject } from "./extract.js";
 import { buildSystemPrompt, loadSkillContext } from "./prompts.js";
 import { runSubAgent } from "./react.js";
-import { DASHBOARD_BASE_URL, resolveModule, setupStepsFor } from "../config.js";
+import { DASHBOARD_BASE_URL, pickModuleForTarget, setupStepsFor } from "../config.js";
 import { readJson } from "../session/files.js";
 import { sessionPaths } from "../session/paths.js";
 import { plannerToolsFor } from "../tools/planner.js";
@@ -49,7 +49,9 @@ export interface PlannerInput {
  * a valid JSON block, throw. The graph maps the throw to status=failed.
  */
 export async function runPlanner(input: PlannerInput): Promise<TestPlan> {
-  const mod = resolveModule(input.target);
+  // Throws if the module can't be inferred — better than silently exploring
+  // /dashboard/payments because resolveModule defaulted there.
+  const mod = pickModuleForTarget(input.targetType, input.target, input.pr);
   const bundle = await loadSkillContext("_planner.md");
 
   const existingTestsAbs = path.join(input.repoPath, input.existingTestsDir);
@@ -76,7 +78,7 @@ export async function runPlanner(input: PlannerInput): Promise<TestPlan> {
       input.pr.body || "(empty)",
       "",
       "PR diff:",
-      input.pr.diff || "(empty)",
+      truncateDiff(input.pr.diff || "(empty)"),
     );
   }
   const system = buildSystemPrompt(
@@ -88,8 +90,8 @@ export async function runPlanner(input: PlannerInput): Promise<TestPlan> {
   const task = [
     "Workflow:",
     `1. Survey existing tests first. Use list_dir on existingTestsDir and pageObjectsDir, then read_file on the specs/POMs targeting the same module ("${mod.path}"). Harvest selectors, beforeEach setup, and API-helper calls — you must reuse them in the plan so the generated suite stays consistent with the rest of the repo. Record what you read in references.existingTests[] and lift reusable locators into selectors.global.`,
-    `2. Call planner_setup_page({ targetPath: "${mod.path}" }) ONCE. This handles signup + login + skip-2FA + navigate deterministically. Do NOT use browser_navigate/browser_type/browser_click on the login or 2FA pages — those steps are owned by the tool. If planner_setup_page reports an error, retry it ONCE; if it still fails, stop and report rather than authenticating manually.`,
-    "3. Once authenticated and on the target page, use the browser_* tools to explore (snapshot, click, wait_for, …) the MODULE itself, and discover selectors via browser_generate_locator. Prefer selectors that already exist in the repo over inventing new ones.",
+    `2. The browser is ALREADY authenticated and on ${mod.path}. Start with browser_snapshot to see what's on the page; then explore with browser_click / browser_wait_for / browser_generate_locator. Do NOT call planner_setup_page — only invoke it if the page has been invalidated (signed out, session expired) and you need to recover.`,
+    "3. Prefer selectors that already exist in the repo over inventing new ones.",
     "4. Call planner_save_plan({ plan: <full JSON> }) with a test plan matching _planner.md §3.6. Required top-level keys:",
     "   sessionId, source, mode, timestamp, url, preconditions, scenarios, selectors.global, featureFlags, references.",
     input.mode === "heal-only"
@@ -142,6 +144,18 @@ export async function runPlanner(input: PlannerInput): Promise<TestPlan> {
   }
   validateTestPlan(plan);
   return plan;
+}
+
+// Cap inlined PR diffs so a 50k-line refactor doesn't blow the local-LLM
+// context window. ~2000 lines is enough for the agent to identify the
+// affected module and a handful of changed components.
+const MAX_DIFF_LINES = 2000;
+
+function truncateDiff(diff: string): string {
+  const lines = diff.split("\n");
+  if (lines.length <= MAX_DIFF_LINES) return diff;
+  const head = lines.slice(0, MAX_DIFF_LINES).join("\n");
+  return `${head}\n(... ${lines.length - MAX_DIFF_LINES} more lines truncated)`;
 }
 
 const VALID_STEP_ACTIONS = new Set([

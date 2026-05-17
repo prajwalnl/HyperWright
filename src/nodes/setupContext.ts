@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { fetchPullRequest } from "../runtime/gh.js";
+import { resetSetupPhase } from "../runtime/setupPhase.js";
 import { ensureDir, writeJson } from "../session/files.js";
 import { loggerFor } from "../session/log.js";
 import { respond } from "../session/respond.js";
@@ -107,6 +108,11 @@ export async function setupContextNode(
   l(`[setup] ========================================`);
   l(`[setup] NODE START: setupContext`);
 
+  // Reset the setup-phase abort coordinator before the fan-out to
+  // setupBackend + setupFrontend. Either node can call abortSetupPhase() on
+  // its own failure to short-circuit the sibling.
+  resetSetupPhase();
+
   // --- Parse Input ---
   const raw = state.rawInput.trim();
   if (!raw) {
@@ -116,7 +122,7 @@ export async function setupContextNode(
       phase: "failed",
       status: "failed",
       error: "rawInput is empty",
-      phaseHistory: ["failed"],
+      phaseHistory: ["setup", "failed"],
       logs,
     });
   }
@@ -163,7 +169,7 @@ export async function setupContextNode(
         target,
         targetType,
         pr: null,
-        phaseHistory: ["failed"],
+        phaseHistory: ["setup", "failed"],
         logs,
       });
     }
@@ -422,7 +428,11 @@ export async function setupContextNode(
     pr,
   };
 
-  const aiGenFlowDir = path.join(repoPath, ".ai-test-gen");
+  // Session artifacts live as a sibling of the cloned repo, not inside it.
+  // Keeping them out of the working tree means finalize doesn't have to stash
+  // them before `gh pr create`, and a stray `git add -A` can never sweep them
+  // into a PR.
+  const aiGenFlowDir = path.join(cloneDir, ".ai-test-gen");
   const inputContextPath = path.join(aiGenFlowDir, "input-context.json");
 
   l(`[setup] Creating .ai-test-gen directory at: ${aiGenFlowDir}`);

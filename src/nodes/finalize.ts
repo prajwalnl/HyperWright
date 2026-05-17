@@ -252,10 +252,10 @@ async function doCommitPush(opts: CommitPushOpts): Promise<void> {
 
     // gh pr create refuses to run with a dirty working tree: in non-TTY
     // mode it logs `Warning: N uncommitted change(s)` and exits 1 without
-    // creating the PR. We deliberately don't commit AI scratch files
-    // (`.ai-test-gen/input-context.json`, etc.), so the working tree is
-    // always dirty here. Stash them temporarily, then pop after gh runs
-    // so the user can still inspect those artifacts in the cloned repo.
+    // creating the PR. Session artifacts now live in the sibling
+    // `.ai-test-gen/` (outside the repo), so the working tree should be
+    // clean here in steady state — this stash/pop is defense-in-depth for
+    // any other untracked file the build process may leave behind.
     //
     // Detection: `git stash push` exits 0 even when there's nothing to
     // stash, printing "No local changes to save" to stdout. We omit
@@ -295,7 +295,6 @@ async function doCommitPush(opts: CommitPushOpts): Promise<void> {
  * "Cleanup" choice: remove the run's generated artifacts but keep the
  * cloned repo intact. Specifically:
  *   - generated *.spec.ts files in the cloned repo
- *   - the .ai-test-gen/ scratch dir (input-context.json + any future siblings)
  *   - per-run JSON artifacts in sessionDir (test-plan, run-results, summary,
  *     bug report, input-context). session.json and logs/ are kept so the
  *     web-ui's history view still works.
@@ -315,10 +314,7 @@ async function doCleanup(
   // 1) Generated spec files.
   await execStepBestEffort(`rm -f "${testsDir}"/*.spec.ts`, repoPath, l);
 
-  // 2) AI scratch files inside the cloned repo (preserve session artifacts).
-  await execStepBestEffort(`rm -f "${repoPath}/.ai-test-gen/input-context.json"`, repoPath, l);
-
-  // 3) Per-run JSON artifacts in sessionDir. session.json + logs/ stay.
+  // 2) Per-run JSON artifacts in sessionDir. session.json + logs/ stay.
   const paths = sessionPaths(sessionDir);
   const perRunArtifacts = [
     paths.testPlan,

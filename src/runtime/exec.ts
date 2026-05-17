@@ -1,6 +1,6 @@
 import { spawn, type SpawnOptions, type ChildProcess } from "node:child_process";
 import { registry } from "./registry.js";
-import { getRuntimeSignal } from "./context.js";
+import { combineSignals, getRuntimeSignal } from "./context.js";
 
 export interface ExecResult {
   code: number | null;
@@ -18,6 +18,12 @@ export interface ExecResult {
 export type RunOptions = SpawnOptions & {
   onStdout?: (line: string) => void;
   onStderr?: (line: string) => void;
+  /**
+   * Per-call abort signal (e.g. setup-phase cancel from a failing sibling).
+   * Combined with the workflow-wide Stop signal so either source SIGTERMs
+   * the child.
+   */
+  signal?: AbortSignal;
 };
 
 /**
@@ -34,7 +40,7 @@ export async function run(
   args: string[],
   opts: RunOptions = {},
 ): Promise<ExecResult> {
-  const { onStdout, onStderr, ...spawnOpts } = opts;
+  const { onStdout, onStderr, signal: extraSignal, ...spawnOpts } = opts;
   return new Promise((resolve) => {
     const child = spawn(cmd, args, {
       ...spawnOpts,
@@ -46,8 +52,13 @@ export async function run(
     // Honor the workflow-scoped AbortSignal so Stop interrupts long-running
     // children (npm install, git clone, playwright test) instead of letting
     // them run to completion in the background. SIGTERM first; the registry
-    // killAll() in stop() handles SIGKILL escalation for survivors.
-    const signal = getRuntimeSignal();
+    // killAll() in stop() handles SIGKILL escalation for survivors. The
+    // caller can also pass a per-call signal (e.g. setup-phase abort from a
+    // failing sibling); we combine the two so either source fires.
+    const runtime = getRuntimeSignal();
+    const signal = extraSignal
+      ? combineSignals(extraSignal)
+      : runtime ?? undefined;
     let onAbort: (() => void) | null = null;
     if (signal) {
       if (signal.aborted) {

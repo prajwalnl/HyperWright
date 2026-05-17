@@ -1,4 +1,5 @@
 import { runPlanner } from "../agents/planner.js";
+import { pickModuleForTarget } from "../config.js";
 import { ENV } from "../env.js";
 import { writeJson } from "../session/files.js";
 import { loggerFor } from "../session/log.js";
@@ -6,6 +7,7 @@ import { sessionPaths } from "../session/paths.js";
 import { respond } from "../session/respond.js";
 import { writeSession } from "../session/sessionFile.js";
 import type { QAStateType, QAStateUpdate } from "../state.js";
+import { AuthSetupError, performAuthSetup } from "../tools/planner.js";
 
 const PLANNER_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -37,7 +39,54 @@ export async function planTestsNode(
   }
 
   l(`target=${state.targetType}:${state.target} mode=${state.mode}`);
-  await writeSession({ ...state, phase: "planning" } as QAStateType);
+  // Best-effort early disk write so the UI sees `phase: "planning"` before the
+  // multi-minute planner call. A failure here must NOT bypass the proper
+  // failure-path respond() below — log and continue.
+  try {
+    await writeSession({ ...state, phase: "planning" } as QAStateType);
+  } catch (err) {
+    l(`warn: early phase write failed (${(err as Error).message}) — continuing`);
+  }
+
+  // Resolve target → module BEFORE auth so we can land the agent on the right
+  // page. Throws (with a useful message) if the module can't be inferred —
+  // better than silently exploring /dashboard/payments.
+  let mod;
+  try {
+    mod = pickModuleForTarget(state.targetType, state.target, state.pr);
+  } catch (err) {
+    const msg = (err as Error).message;
+    l(`failure: ${msg}`);
+    return respond(state, {
+      phase: "failed",
+      status: "failed",
+      error: `Planning failed: ${msg}`,
+      logs,
+    });
+  }
+  l(`module=${mod.path}`);
+
+  // Deterministic auth: signup → login → 2FA-skip → goto(mod.path). Lifted
+  // out of the sub-agent so the agent CAN'T skip/re-order it — by the time
+  // the agent runs, the browser is on the target page and ready to explore.
+  try {
+    const authLines = await performAuthSetup({
+      targetPath: mod.path,
+      creds: state.creds,
+    });
+    for (const line of authLines) l(`auth: ${line}`);
+  } catch (err) {
+    const e = err as AuthSetupError | Error;
+    const steps = e instanceof AuthSetupError ? e.steps : [];
+    for (const line of steps) l(`auth: ${line}`);
+    l(`failure: auth setup failed — ${e.message}`);
+    return respond(state, {
+      phase: "failed",
+      status: "failed",
+      error: `Planning failed: auth setup — ${e.message}`,
+      logs,
+    });
+  }
 
   // Cap the sub-agent so a hung browser/LLM doesn't pin the workflow. The
   // signal is combined with the workflow-wide Stop signal inside runSubAgent,

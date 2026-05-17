@@ -168,7 +168,7 @@ class ProcessRegistry {
 
   /**
    * Defensive sweep for orphans from a previous runner-process incarnation.
-   * Reads the most-recent hcc-{id}/cloned-repo/.ai-test-gen/servers.json and
+   * Reads the most-recent hcc-{id}/.ai-test-gen/servers.json and
    * SIGTERM/SIGKILLs any pgids still alive. Called once on runner boot so
    * the user doesn't have to manually kill -9 after a server restart.
    */
@@ -179,7 +179,7 @@ class ProcessRegistry {
     let latest: { mtime: number; data: ServersFile } | null = null;
     try {
       for await (const entry of glob(
-        "hcc-*/cloned-repo/.ai-test-gen/servers.json",
+        "hcc-*/.ai-test-gen/servers.json",
         { cwd: workdir, withFileTypes: true },
       )) {
         if (!entry.isFile()) continue;
