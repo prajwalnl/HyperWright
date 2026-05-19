@@ -12,7 +12,11 @@ import type { QAStateType, QAStateUpdate } from "../state.js";
  * spec. We run it at the repo root so the project's tsconfig resolves imports
  * (@playwright/test, ../support/helper), then filter output for diagnostics
  * that name the generated file — pre-existing errors elsewhere in the repo
- * are not our problem and shouldn't fail the graph.
+ * are not our problem and shouldn't fail the graph. Match on the
+ * repo-relative path (tsc emits `path/to/file.ts(line,col): …`) so we don't
+ * confuse our spec with an unrelated file that happens to share a basename.
+ * If tsc itself exits non-zero with no attributable diagnostics, surface it
+ * as a tooling failure rather than silently passing.
  */
 async function typecheckGeneratedFiles(
   files: string[],
@@ -23,14 +27,30 @@ async function typecheckGeneratedFiles(
   log(`[generate] Running tsc --noEmit in ${repoPath}...`);
   const result = await sh("npx tsc --noEmit 2>&1", { cwd: repoPath });
   log(`[generate] tsc exited with code: ${result.code}`);
-  const basenames = new Set(files.map((f) => path.basename(f)));
-  const diagnostics = (result.stdout + "\n" + result.stderr)
+  const relPaths = files.map((f) => path.relative(repoPath, f));
+  const combined = result.stdout + "\n" + result.stderr;
+  const diagnostics = combined
     .split("\n")
     .filter(
       (line) =>
         /error TS\d+/i.test(line) &&
-        [...basenames].some((b) => line.includes(b)),
+        relPaths.some((rel) => line.includes(rel)),
     );
+  if (
+    diagnostics.length === 0 &&
+    result.code !== 0 &&
+    result.code !== null
+  ) {
+    const tail = combined
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .slice(-5)
+      .join(" | ");
+    return [
+      `tsc failed (exit ${result.code}) without diagnostics naming generated files: ${tail || "(no output)"}`,
+    ];
+  }
   return diagnostics;
 }
 
@@ -48,8 +68,21 @@ export async function generateTestsNode(
     l(`[generate] ========================================`);
     return respond(state, {
       phase: "failed",
+      phaseHistory: ["failed"],
       status: "failed",
       error: "generateTests called without a test plan",
+      logs,
+    });
+  }
+
+  if (state.testPlan.scenarios.length === 0) {
+    l(`[generate] ERROR: Test plan has zero scenarios`);
+    l(`[generate] ========================================`);
+    return respond(state, {
+      phase: "failed",
+      phaseHistory: ["failed"],
+      status: "failed",
+      error: "generateTests called with an empty test plan (no scenarios)",
       logs,
     });
   }
@@ -97,6 +130,7 @@ export async function generateTestsNode(
         generatedFiles: out.files,
         metrics: { testsGenerated: out.testsGenerated },
         phase: "failed",
+        phaseHistory: ["generating", "failed"],
         status: "failed",
         error: `TypeScript validation failed: ${diagnostics[0]}`,
         logs,
@@ -120,6 +154,7 @@ export async function generateTestsNode(
     l(`[generate] ========================================`);
     return respond(state, {
       phase: "failed",
+      phaseHistory: ["generating", "failed"],
       status: "failed",
       error: `Generation failed: ${(err as Error).message}`,
       logs,

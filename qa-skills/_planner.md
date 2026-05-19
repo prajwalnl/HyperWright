@@ -196,7 +196,7 @@ Write `test-plan.json`:
       "preconditions": ["Specific setup for this scenario"],
       "steps": [
         {
-          "action": "navigate|click|type|select|verify|api",
+          "action": "navigate|click|type|press|select|verify|wait|api",
           "target": "selector or description",
           "value": "input value",
           "expected": "expected outcome"

@@ -23,8 +23,8 @@ const mergeServers = (prev: Servers, next: Partial<Servers>): Servers => ({
   ...next,
 });
 const mergeMetrics = (prev: Metrics, next: Partial<Metrics>): Metrics => ({
-  testsPlanned: prev.testsPlanned + (next.testsPlanned ?? 0),
-  testsGenerated: prev.testsGenerated + (next.testsGenerated ?? 0),
+  testsPlanned: next.testsPlanned ?? prev.testsPlanned,
+  testsGenerated: next.testsGenerated ?? prev.testsGenerated,
   testsPassed: next.testsPassed ?? prev.testsPassed,
   testsFailed: next.testsFailed ?? prev.testsFailed,
   testsFixed: next.testsFixed ?? prev.testsFixed,
@@ -83,7 +83,7 @@ export const QAState = Annotation.Root({
     default: () => null,
   }),
   generatedFiles: Annotation<string[]>({
-    reducer: appendArray,
+    reducer: lastWriteWins,
     default: () => [],
   }),
   runResults: Annotation<RunResults | null>({

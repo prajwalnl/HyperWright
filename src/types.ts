@@ -91,6 +91,7 @@ export interface ScenarioStep {
     | "navigate"
     | "click"
     | "type"
+    | "press"
     | "select"
     | "verify"
     | "api"

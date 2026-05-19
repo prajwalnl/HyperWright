@@ -104,14 +104,24 @@ export async function runGenerator(
     noBrowser: true,
     log: input.log,
   });
+
+  // Reject prose-only responses up front: extractFencedCode falls back to the
+  // raw text when no fence is present, which would let stray commentary slip
+  // through the shape checks below.
+  if (!/```/.test(raw)) {
+    throw new Error(
+      "generator output had no fenced code block (expected a single ```typescript block)",
+    );
+  }
   const code = extractFencedCode(raw);
 
-  if (
-    !/import\s+.*@playwright\/test/.test(code) ||
-    !/test\.describe\(/.test(code)
-  ) {
+  const hasRuntimeImport =
+    /import\s+(?!type\b)[^;]*from\s+['"]@playwright\/test['"]/.test(code);
+  const hasDescribe = /test\.describe\s*\(/.test(code);
+  const hasTestCall = /(^|[^.\w])test\s*\(/m.test(code);
+  if (!hasRuntimeImport || !hasDescribe || !hasTestCall) {
     throw new Error(
-      "generator output did not look like a Playwright spec (missing @playwright/test import or test.describe)",
+      "generator output did not look like a Playwright spec (need runtime @playwright/test import, test.describe(...), and at least one test(...) call)",
     );
   }
 

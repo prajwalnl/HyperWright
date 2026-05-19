@@ -162,6 +162,7 @@ const VALID_STEP_ACTIONS = new Set([
   "navigate",
   "click",
   "type",
+  "press",
   "select",
   "verify",
   "api",
