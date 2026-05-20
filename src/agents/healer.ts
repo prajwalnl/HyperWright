@@ -4,6 +4,7 @@ import { extractJsonObject } from "./extract.js";
 import { buildSystemPrompt, loadSkillContext } from "./prompts.js";
 import { runSubAgent } from "./react.js";
 import { runPlaywrightTest } from "../runtime/playwright.js";
+import { typecheckFiles } from "../runtime/typecheck.js";
 import { sharedAuthToolsFor } from "../tools/planner.js";
 import type {
   Creds,
@@ -102,6 +103,34 @@ export async function runHealer(input: HealerInput): Promise<HealerOutput> {
     )
     .join("\n");
 
+  // Cross-attempt context: on attempt >=2 surface what the previous attempt
+  // saw and which tests already had fixes applied. Lets the sub-agent spot
+  // patterns ("test X keeps failing despite a selector fix — escalate to
+  // root-cause") and avoid re-trying identical edits that didn't stick.
+  const historySections: string[] = [];
+  if (input.previousResults) {
+    const prev = input.previousResults;
+    historySections.push(
+      "Previous attempt summary:",
+      `  passed=${prev.summary.passed} failed=${prev.summary.failed}`,
+      "Previous failures (JSON):",
+      "```json",
+      JSON.stringify(prev.failures, null, 2),
+      "```",
+      "",
+    );
+  }
+  if (input.priorFixes.length > 0) {
+    historySections.push(
+      `Fixes already applied across earlier attempts (${input.priorFixes.length}):`,
+      "```json",
+      JSON.stringify(input.priorFixes, null, 2),
+      "```",
+      "If a test in this list is still failing, the prior fix was insufficient — diagnose deeper rather than repeating the same edit.",
+      "",
+    );
+  }
+
   const context = [
     `attempt: ${input.attempt}/${input.maxAttempts}`,
     `editable spec files (${fileBundle.size}):`,
@@ -109,6 +138,7 @@ export async function runHealer(input: HealerInput): Promise<HealerOutput> {
       .map((f) => `  - ${f}`)
       .join("\n"),
     "",
+    ...historySections,
     "Failing tests (JSON):",
     "```json",
     JSON.stringify(initial.failures, null, 2),
@@ -161,14 +191,36 @@ export async function runHealer(input: HealerInput): Promise<HealerOutput> {
     parsed = { edits: [] };
   }
 
+  // Apply longest `find` first. `String.prototype.replace` only changes the
+  // first match, so when two edits target overlapping substrings the shorter
+  // one can be subsumed by the longer one's replacement. Sorting by descending
+  // length keeps the more-specific match deterministic. (No stable tie-break
+  // is needed — same-length finds don't collide in practice.)
+  const sortedEdits = (parsed.edits ?? [])
+    .slice()
+    .sort((a, b) => (b.find?.length ?? 0) - (a.find?.length ?? 0));
+
   const appliedEdits: RunHealingBlock["testsFixed"] = [];
   const mutated = new Map<string, string>(fileBundle);
-  for (const edit of parsed.edits ?? []) {
-    if (!edit.find) continue;
+  for (const edit of sortedEdits) {
+    if (!edit.find) {
+      input.log?.(`[heal] dropped edit with empty find (test="${edit.test ?? "?"}")`);
+      continue;
+    }
     const target = resolveEditFile(edit.file, fileBundle);
-    if (!target) continue;
+    if (!target) {
+      input.log?.(
+        `[heal] dropped edit — could not resolve file hint "${edit.file ?? "(none)"}" against ${fileBundle.size} editable spec(s)`,
+      );
+      continue;
+    }
     const cur = mutated.get(target) ?? "";
-    if (!cur.includes(edit.find)) continue;
+    if (!cur.includes(edit.find)) {
+      input.log?.(
+        `[heal] dropped edit on ${path.basename(target)} — find substring not present (likely consumed by a prior edit): ${truncate(edit.find, 80)}`,
+      );
+      continue;
+    }
     mutated.set(target, cur.replace(edit.find, edit.replace));
     appliedEdits.push({
       test: edit.test,
@@ -179,15 +231,40 @@ export async function runHealer(input: HealerInput): Promise<HealerOutput> {
     });
   }
 
-  // Flush mutated files back to disk.
+  // Track which files actually changed so we can revert just those on
+  // typecheck failure (and only flush those to disk in the happy path).
+  const changedFiles: string[] = [];
   for (const [file, content] of mutated.entries()) {
     if (content !== fileBundle.get(file)) {
+      changedFiles.push(file);
       await fs.writeFile(file, content, "utf8");
     }
   }
 
   if (appliedEdits.length === 0) {
     // No edits applied — re-running would just reproduce the same failures.
+    return withHealing(initial, 0, input);
+  }
+
+  // Defence against a model that produced syntactically/type-broken edits:
+  // typecheck the changed specs before the post-fix re-run. If tsc rejects
+  // them, revert each file to its pre-edit content and treat the attempt as
+  // a no-op so the node's stall guard fires instead of looping on bad code.
+  const diagnostics = await typecheckFiles(
+    changedFiles,
+    input.repoPath,
+    input.log ?? (() => {}),
+    "heal",
+  );
+  if (diagnostics.length > 0) {
+    input.log?.(
+      `[heal] post-edit typecheck failed (${diagnostics.length} diagnostic(s)) — reverting ${changedFiles.length} file(s) and reporting 0 fixes`,
+    );
+    for (const d of diagnostics.slice(0, 5)) input.log?.(`[heal]   ${d}`);
+    for (const file of changedFiles) {
+      const original = fileBundle.get(file);
+      if (original != null) await fs.writeFile(file, original, "utf8");
+    }
     return withHealing(initial, 0, input);
   }
 
@@ -199,6 +276,10 @@ export async function runHealer(input: HealerInput): Promise<HealerOutput> {
   });
 
   return withHealing(postFix, appliedEdits.length, input, appliedEdits);
+}
+
+function truncate(s: string, n: number): string {
+  return s.length <= n ? s : `${s.slice(0, n)}…`;
 }
 
 async function readFileBundle(
@@ -241,19 +322,19 @@ function withHealing(
   input: HealerInput,
   newFixes: RunHealingBlock["testsFixed"] = [],
 ): HealerOutput {
-  const allPass = results.summary.failed === 0;
-  const exhausted = input.attempt >= input.maxAttempts;
+  // Always attach the healing block so the persisted run-results.json never
+  // disagrees with state.metrics. The previous behaviour gated inclusion on
+  // `allPass || exhausted`, which dropped the block on stalls (failures
+  // remain but no edits applied this attempt) — that's still terminal in the
+  // node's eyes, so the artifact must reflect the heal history regardless.
   const healing: RunHealingBlock = {
     attempts: input.attempt,
     testsFixed: [...input.priorFixes, ...newFixes],
     testsStillFailing: results.summary.failed,
-    allTestsPassed: allPass,
+    allTestsPassed: results.summary.failed === 0,
   };
   return {
-    results: {
-      ...results,
-      healing: allPass || exhausted ? healing : undefined,
-    },
+    results: { ...results, healing },
     fixesApplied,
   };
 }

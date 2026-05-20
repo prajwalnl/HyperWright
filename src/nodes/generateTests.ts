@@ -1,58 +1,10 @@
-import path from "node:path";
 import { ENV } from "../env.js";
 import { runGenerator } from "../agents/generator.js";
-import { sh } from "../runtime/exec.js";
+import { typecheckFiles } from "../runtime/typecheck.js";
 import { createNodeLogger, loggerFor } from "../session/log.js";
 import { respond } from "../session/respond.js";
 import { writeSession } from "../session/sessionFile.js";
 import type { QAStateType, QAStateUpdate } from "../state.js";
-
-/**
- * orchestrator.md §4 "Verify" requires `npx tsc --noEmit` on the generated
- * spec. We run it at the repo root so the project's tsconfig resolves imports
- * (@playwright/test, ../support/helper), then filter output for diagnostics
- * that name the generated file — pre-existing errors elsewhere in the repo
- * are not our problem and shouldn't fail the graph. Match on the
- * repo-relative path (tsc emits `path/to/file.ts(line,col): …`) so we don't
- * confuse our spec with an unrelated file that happens to share a basename.
- * If tsc itself exits non-zero with no attributable diagnostics, surface it
- * as a tooling failure rather than silently passing.
- */
-async function typecheckGeneratedFiles(
-  files: string[],
-  repoPath: string,
-  log: (line: string) => void,
-): Promise<string[]> {
-  if (files.length === 0) return [];
-  log(`[generate] Running tsc --noEmit in ${repoPath}...`);
-  const result = await sh("npx tsc --noEmit 2>&1", { cwd: repoPath });
-  log(`[generate] tsc exited with code: ${result.code}`);
-  const relPaths = files.map((f) => path.relative(repoPath, f));
-  const combined = result.stdout + "\n" + result.stderr;
-  const diagnostics = combined
-    .split("\n")
-    .filter(
-      (line) =>
-        /error TS\d+/i.test(line) &&
-        relPaths.some((rel) => line.includes(rel)),
-    );
-  if (
-    diagnostics.length === 0 &&
-    result.code !== 0 &&
-    result.code !== null
-  ) {
-    const tail = combined
-      .split("\n")
-      .map((l) => l.trim())
-      .filter(Boolean)
-      .slice(-5)
-      .join(" | ");
-    return [
-      `tsc failed (exit ${result.code}) without diagnostics naming generated files: ${tail || "(no output)"}`,
-    ];
-  }
-  return diagnostics;
-}
 
 export async function generateTestsNode(
   state: QAStateType,
@@ -121,7 +73,7 @@ export async function generateTestsNode(
       l(`[generate]   → ${f}`);
     }
 
-    const diagnostics = await typecheckGeneratedFiles(out.files, repoPath, l);
+    const diagnostics = await typecheckFiles(out.files, repoPath, l, "generate");
     if (diagnostics.length > 0) {
       l(`[generate] ERROR: TypeScript validation failed with ${diagnostics.length} diagnostic(s):`);
       for (const d of diagnostics.slice(0, 20)) l(`[generate]   ${d}`);
