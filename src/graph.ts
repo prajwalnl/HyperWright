@@ -8,7 +8,6 @@ import { setupJoinNode } from "./nodes/setupJoin.js";
 import { planTestsNode } from "./nodes/planTests.js";
 import { generateTestsNode } from "./nodes/generateTests.js";
 import { healTestsNode } from "./nodes/healTests.js";
-import { finalizeNode } from "./nodes/finalize.js";
 import { summaryNode } from "./nodes/summary.js";
 
 import {
@@ -36,15 +35,14 @@ import {
  *                                          healTests
  *                                              │
  *                                              ▼
- *                                          finalize  [interrupt()]
- *                                              │  (commit-push | cleanup)
- *                                              ▼
- *                                           summary
- *                                              │
+ *                                          summary  [teardown → report → HITL → ship]
+ *                                              │  (create-pr | cancel)
  *                                              ▼
  *                                             END
  *
- * Any node that sets status = "failed" short-circuits to summary → END.
+ * `summary` is the single terminal node. Every short-circuit on
+ * status="failed" also lands here, so teardown (Step 1 of summary) always
+ * runs — servers cannot leak on the failure path.
  */
 export function buildGraph() {
   const workflow = new StateGraph(QAState)
@@ -55,7 +53,6 @@ export function buildGraph() {
     .addNode("planTests", planTestsNode)
     .addNode("generateTests", generateTestsNode)
     .addNode("healTests", healTestsNode)
-    .addNode("finalize", finalizeNode)
     .addNode("summary", summaryNode);
 
   workflow.addEdge(START, "setupContext");
@@ -87,11 +84,8 @@ export function buildGraph() {
 
   workflow.addConditionalEdges("healTests", healRouter, {
     healTests: "healTests",
-    finalize: "finalize",
     summary: "summary",
   });
-
-  workflow.addEdge("finalize", "summary");
 
   workflow.addEdge("summary", END);
 

@@ -166,7 +166,7 @@ export function spawnBackground(
  *   - `src/runtime/ports.ts` → `ensurePortFree(port)` (multi-pass + pgrp + verify)
  *   - `src/runtime/registry.ts` → `registry.killAll()` (owns full lifecycle)
  * This one-shot helper is only for callers that already know the pid and
- * just need to ask it to exit (e.g. finalize's "kill backend on cleanup").
+ * just need to ask it to exit (e.g. the summary node's "kill backend on teardown").
  */
 export async function killPid(pid: number, signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
   try {

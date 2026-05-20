@@ -37,7 +37,8 @@ export function afterGenerate(state: QAStateType): string {
  *   - attempts not exhausted
  *   - failures still present
  *   - last attempt actually applied fixes (else we'd just spin)
- * Otherwise move to the human-in-the-loop pause inside `finalize`.
+ * Otherwise move to the terminal `summary` node, which itself handles the
+ * teardown + HITL + ship sequence.
  */
 export function healRouter(state: QAStateType): string {
   if (state.status === "failed") return "summary";
@@ -45,9 +46,9 @@ export function healRouter(state: QAStateType): string {
   const attempts = state.metrics.healingAttempts;
   const failed = state.runResults?.summary.failed ?? 0;
 
-  if (failed === 0) return "finalize";
-  if (attempts >= state.maxHealingAttempts) return "finalize";
-  if (state.lastAttemptFixes === 0) return "finalize";
+  if (failed === 0) return "summary";
+  if (attempts >= state.maxHealingAttempts) return "summary";
+  if (state.lastAttemptFixes === 0) return "summary";
 
   return "healTests";
 }

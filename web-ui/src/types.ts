@@ -1,4 +1,5 @@
 export type {
+  InterruptPayload,
   StartRequest,
   WorkflowEvent,
   WorkflowSnapshot,

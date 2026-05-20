@@ -22,7 +22,7 @@ import type { QAStateType, QAStateUpdate } from "../state.js";
  *      fix tests, re-run. (Delegated to `runHealer`, which owns the
  *      sub-agent + post-fix re-run within a single attempt.)
  *   4. If this is the last attempt and tests are still failing → write a
- *      bug report and let the graph continue to finalize.
+ *      bug report and let the graph continue to the terminal `summary` node.
  *   5. Persist run-results + metrics + session and return.
  */
 export async function healTestsNode(

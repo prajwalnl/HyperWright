@@ -60,12 +60,24 @@ export interface WorkflowSnapshot {
   logs: string[];
 }
 
+/**
+ * Payload of the HITL `interrupt()` raised inside the summary node. Mirrors
+ * the shape passed to `interrupt(...)` in src/nodes/summary.ts. Surfaced to
+ * the client on the `awaiting_choice` event so the HITL bar can render the
+ * prompt + a bug-report preview without round-tripping to the server.
+ */
+export interface InterruptPayload {
+  prompt: string;
+  summary: { total: number; passed: number; failed: number; skipped: number };
+  bugReportPreview: string | null;
+}
+
 /** Any one event the server broadcasts over SSE. */
 export type WorkflowEvent =
   | { type: "started"; thread: string }
   | { type: "state"; snapshot: WorkflowSnapshot; currentNodes: string[]; nextNodes: string[] }
   | { type: "log"; node: string; line: string }
-  | { type: "awaiting_choice" }
+  | { type: "awaiting_choice"; payload: InterruptPayload | null }
   /**
    * Emitted as soon as stop() begins, before kills/cleanup finish. UI shows a
    * "stopping…" spinner; Start stays disabled until `stopped` arrives.

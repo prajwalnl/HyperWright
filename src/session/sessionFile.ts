@@ -36,6 +36,6 @@ export async function writeSession(
   const paths = sessionPaths(state.sessionDir);
   const existing = (await readJson<SessionFile>(paths.session)) ?? null;
   const snapshot = buildSessionFile(state);
-  const merged: SessionFile = { ...snapshot, ...(existing ?? {}), ...snapshot, ...patch };
+  const merged: SessionFile = { ...(existing ?? {}), ...snapshot, ...patch };
   await writeJson(paths.session, merged);
 }

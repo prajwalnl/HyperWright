@@ -19,15 +19,18 @@ export type Status = "in_progress" | "failed" | "complete";
 
 /**
  * Two terminal actions exposed at the HITL pause:
- *   1) commit-push — commit + push generated tests on the branch
- *                    setupContext put us on. When `repo.isNewBranch === true`
- *                    (fresh `pw/...` branch for module/scenario/merged-PR
- *                    runs), also opens a GitHub PR via `gh pr create` — the
- *                    UI relabels the button to "Create PR".
- *   2) cleanup     — drop generated specs + per-run JSON artifacts. The
- *                    cloned repo is preserved.
+ *   1) create-pr — format + stage + commit + push generated tests on the
+ *                  branch setupContext put us on. When `repo.isNewBranch === true`
+ *                  (fresh `pw/...` branch for module/scenario/merged-PR runs),
+ *                  also opens a GitHub PR via `gh pr create`. When a
+ *                  `bug-report.md` exists, it is embedded inline in the PR body
+ *                  via a collapsible <details> block.
+ *   2) cancel    — pure no-op. Nothing is committed, nothing is deleted. The
+ *                  generated specs stay in the cloned repo, every sessionDir
+ *                  artifact (bug-report, run-results, summary, logs) is
+ *                  preserved for post-mortem inspection.
  */
-export type UserChoice = "commit-push" | "cleanup";
+export type UserChoice = "create-pr" | "cancel";
 
 export interface Creds {
   email: string;
@@ -69,10 +72,10 @@ export interface RepoInfo {
    * True when setupContext created a fresh `pw/...` session branch off main
    * (because the target was a module/scenario, or `gh pr checkout` failed
    * for a merged-and-deleted PR head). False when we kept an existing
-   * branch (open-PR head, explicit `branch:` directive). finalize uses this
-   * to decide whether to open a PR via `gh pr create` — pushing to an
-   * already-existing PR branch updates that PR; pushing to a fresh branch
-   * needs a new PR opened explicitly.
+   * branch (open-PR head, explicit `branch:` directive). The `summary`
+   * node's create-pr step uses this to decide whether to open a PR via
+   * `gh pr create` — pushing to an already-existing PR branch updates that
+   * PR; pushing to a fresh branch needs a new PR opened explicitly.
    */
   isNewBranch: boolean;
 }

@@ -9,9 +9,15 @@ import { readJson, writeJson } from "../../src/session/files.js";
 import { logger } from "../../src/session/logger.js";
 import { registry } from "../../src/runtime/registry.js";
 import { setRuntimeSignal } from "../../src/runtime/context.js";
+import { stopServers as stopServersHelper } from "../../src/runtime/teardown.js";
 import type { QAStateType } from "../../src/state.js";
 import type { TargetType, UserChoice } from "../../src/types.js";
-import type { RunStatus, WorkflowEvent, WorkflowSnapshot } from "./types.js";
+import type {
+  InterruptPayload,
+  RunStatus,
+  WorkflowEvent,
+  WorkflowSnapshot,
+} from "./types.js";
 import { glob } from "node:fs/promises";
 
 // Resolve workspace root for session discovery
@@ -48,6 +54,12 @@ class Runner extends EventEmitter {
    */
   private runStatus: RunStatus = "idle";
   private terminal: TerminalEvent | null = null;
+  /**
+   * Latest payload from the `interrupt()` raised inside the `summary` node.
+   * Cached so the SSE reconnect path can replay it to clients that land
+   * during a paused state.
+   */
+  private lastInterruptPayload: InterruptPayload | null = null;
   private abortController: AbortController | null = null;
   /**
    * Each invocation of start/resume captures `currentAC` at
@@ -277,6 +289,7 @@ class Runner extends EventEmitter {
     nextNodes: string[];
     terminal: TerminalEvent | null;
     threadId: string | null;
+    interruptPayload: InterruptPayload | null;
   } {
     return {
       runStatus: this.runStatus,
@@ -287,6 +300,7 @@ class Runner extends EventEmitter {
       nextNodes: this.nextNodes,
       terminal: this.terminal,
       threadId: this.threadId,
+      interruptPayload: this.lastInterruptPayload,
     };
   }
 
@@ -316,6 +330,7 @@ class Runner extends EventEmitter {
     this.currentNodes = [];
     this.nextNodes = [];
     this.terminal = null;
+    this.lastInterruptPayload = null;
     this.logsByNode.clear();
     const ac = new AbortController();
     this.abortController = ac;
@@ -384,6 +399,7 @@ class Runner extends EventEmitter {
       );
     }
     this.terminal = null;
+    this.lastInterruptPayload = null;
     this.setRunStatus("running");
     const ac = new AbortController();
     this.abortController = ac;
@@ -420,8 +436,12 @@ class Runner extends EventEmitter {
 
   /**
    * Inspect graph state after a stream ends. Two terminal-ish outcomes:
-   *   1. Paused at finalize (HITL) → emit `awaiting_choice`
-   *   2. Genuinely finished        → emit `finished`
+   *   1. Paused inside `summary` at the HITL interrupt → emit `awaiting_choice`
+   *   2. Genuinely finished                            → emit `finished`
+   *
+   * The `awaiting_choice` event carries the interrupt's payload (the prompt,
+   * the test summary, and the bug-report preview) so the client can render
+   * an informed HITL bar.
    */
   private async handleStreamEnd(
     config: { configurable: { thread_id: string } },
@@ -439,10 +459,14 @@ class Runner extends EventEmitter {
     const next = state.next as string[];
     const hasInterrupts = state.tasks.some((t) => t.interrupts.length > 0);
 
-    if (next.includes("finalize") || hasInterrupts) {
+    if (hasInterrupts) {
       this.setRunStatus("paused");
       this.nextNodes = next;
-      this.publish({ type: "awaiting_choice" });
+      this.lastInterruptPayload = extractInterruptPayload(state.tasks);
+      this.publish({
+        type: "awaiting_choice",
+        payload: this.lastInterruptPayload,
+      });
       return;
     }
     this.finalise();
@@ -531,6 +555,48 @@ class Runner extends EventEmitter {
   }
 
   /**
+   * Side-effect-only teardown of the backend + frontend servers this session
+   * (or a prior session) started. Does NOT touch graph state, runStatus, or
+   * the interrupt — the user can keep the HITL bar open, click cancel after,
+   * or just walk away. Intended for the "Stop Servers" button (HITL + left
+   * sidebar) that the iteration workflow needs.
+   *
+   * Idempotent: the underlying helper gates on `*WasStarted` flags, so this
+   * is a cheap no-op when no servers were started this session.
+   */
+  async stopServers(): Promise<void> {
+    if (!this.lastSnapshot) {
+      // No live session → no PIDs we own. Refuse rather than guess.
+      return;
+    }
+    const repoPath = this.lastSnapshot.repo.repoPath || process.cwd();
+    await stopServersHelper(this.lastSnapshot.servers, repoPath, (line) => {
+      logger.log("teardown", line);
+    });
+    // Reflect the new server state in the snapshot so the UI's Services
+    // badges turn red and the Stop Servers button greys out. We mutate
+    // lastSnapshot directly and re-publish a state event — the graph state
+    // is intentionally NOT updated (this is a runtime side effect, not a
+    // graph transition).
+    this.lastSnapshot = {
+      ...this.lastSnapshot,
+      servers: {
+        ...this.lastSnapshot.servers,
+        backendUp: false,
+        frontendUp: false,
+        backendPid: null,
+        frontendPid: null,
+      },
+    };
+    this.publish({
+      type: "state",
+      snapshot: this.lastSnapshot,
+      currentNodes: this.currentNodes,
+      nextNodes: this.nextNodes,
+    });
+  }
+
+  /**
    * Reset. Stops first if not already terminal, then wipes in-memory state
    * and emits a `reset` event so the client can clear its UI.
    */
@@ -543,6 +609,7 @@ class Runner extends EventEmitter {
     this.currentNodes = [];
     this.nextNodes = [];
     this.terminal = null;
+    this.lastInterruptPayload = null;
     this.logsByNode.clear();
     this.abortController = null;
     this.inflight = null;
@@ -645,6 +712,39 @@ function toSnapshot(state: QAStateType): WorkflowSnapshot {
     completedAt: state.completedAt,
     logs: state.logs,
   };
+}
+
+/**
+ * Pull the most-recent interrupt value out of `state.tasks`. Returns null
+ * when the shape doesn't match our `InterruptPayload` contract — we do a
+ * loose structural check so the LangGraph internal types don't infect us.
+ */
+function extractInterruptPayload(
+  tasks: ReadonlyArray<{ interrupts: ReadonlyArray<unknown> }>,
+): InterruptPayload | null {
+  for (const task of tasks) {
+    for (const interrupt of task.interrupts) {
+      const value =
+        interrupt != null && typeof interrupt === "object" && "value" in interrupt
+          ? (interrupt as { value: unknown }).value
+          : interrupt;
+      if (
+        value != null &&
+        typeof value === "object" &&
+        "prompt" in value &&
+        "summary" in value
+      ) {
+        const v = value as Record<string, unknown>;
+        return {
+          prompt: String(v.prompt ?? ""),
+          summary: v.summary as InterruptPayload["summary"],
+          bugReportPreview:
+            typeof v.bugReportPreview === "string" ? v.bugReportPreview : null,
+        };
+      }
+    }
+  }
+  return null;
 }
 
 export const runner = new Runner();

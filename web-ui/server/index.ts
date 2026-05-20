@@ -80,10 +80,10 @@ app.post("/api/workflow/start", async (c) => {
 
 app.post("/api/workflow/resume", async (c) => {
   const body = await c.req.json<{ choice: UserChoice }>();
-  const valid: UserChoice[] = ["commit-push", "cleanup"];
+  const valid: UserChoice[] = ["create-pr", "cancel"];
   if (!valid.includes(body.choice)) {
     return c.json(
-      { error: "choice must be commit-push | cleanup" },
+      { error: "choice must be create-pr | cancel" },
       400,
     );
   }
@@ -94,6 +94,17 @@ app.post("/api/workflow/resume", async (c) => {
     return c.json({ ok: true });
   } catch (err) {
     return c.json({ error: (err as Error).message }, 409);
+  }
+});
+
+app.post("/api/workflow/stop-servers", async (c) => {
+  try {
+    void runner.stopServers().catch((err) => {
+      console.error("[runner.stopServers] failed:", err);
+    });
+    return c.json({ ok: true });
+  } catch (err) {
+    return c.json({ error: (err as Error).message }, 500);
   }
 });
 
@@ -155,7 +166,10 @@ app.get("/api/workflow/stream", (c) => {
         await writeEvent(sse, status.terminal);
       }
       if (status.runStatus === "paused") {
-        await writeEvent(sse, { type: "awaiting_choice" });
+        await writeEvent(sse, {
+          type: "awaiting_choice",
+          payload: status.interruptPayload,
+        });
       }
     }
 

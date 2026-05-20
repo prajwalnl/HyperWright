@@ -16,7 +16,9 @@ export interface FlowNodeData {
 /** Mirror of graph.ts topology. Positions laid out top-to-bottom.
  *
  * Every node sits on the center spine. Full mode is the primary path:
- *   planTests → generateTests → healTests → finalize → summary.
+ *   planTests → generateTests → healTests → summary.
+ * `summary` is the single terminal node — it internally runs teardown,
+ * the HITL interrupt, and the create-pr / cancel ship step.
  * The heal-only edge skips generateTests by exiting planTests's right
  * handle, sweeping through the right gutter, and re-entering healTests's
  * right handle.
@@ -29,8 +31,7 @@ export const GRAPH_NODES: Node<FlowNodeData>[] = [
   nd("planTests", 300, 540, "Plan Tests", "_planner.md"),
   nd("generateTests", 300, 720, "Generate Tests", "_generator.md"),
   nd("healTests", 300, 900, "Heal Tests", "_healer.md · loops ≤ 3"),
-  nd("finalize", 282, 1080, "Finalize", "HITL · commit-push | cleanup"),
-  nd("summary", 300, 1260, "Summary", "summary.json"),
+  nd("summary", 258, 1080, "Summary", "teardown · HITL · create-pr | cancel"),
 ];
 
 export const GRAPH_EDGES: Edge[] = [
@@ -54,8 +55,7 @@ export const GRAPH_EDGES: Edge[] = [
     style: { stroke: "#324056" },
   } as SmoothStepEdgeWithPathOptions,
   ed("generateTests", "healTests"),
-  ed("healTests", "finalize"),
-  ed("finalize", "summary"),
+  ed("healTests", "summary"),
 ];
 
 function nd(

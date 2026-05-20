@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type {
+  InterruptPayload,
   StartRequest,
   WorkflowEvent,
   WorkflowSnapshot,
@@ -17,6 +18,7 @@ interface PersistedState {
   logsByNode: Array<[string, string[]]>;
   runStatus: RunStatus;
   error: string | null;
+  interruptPayload: InterruptPayload | null;
 }
 
 function serializeState(state: WorkflowState): PersistedState {
@@ -28,6 +30,7 @@ function serializeState(state: WorkflowState): PersistedState {
     logsByNode: Array.from(state.logsByNode.entries()),
     runStatus: state.runStatus,
     error: state.error,
+    interruptPayload: state.interruptPayload,
   };
 }
 
@@ -52,6 +55,7 @@ function deserializeState(persisted: PersistedState): WorkflowState {
     logsByNode: new Map(persisted.logsByNode),
     runStatus: status,
     error: persisted.error,
+    interruptPayload: persisted.interruptPayload ?? null,
   };
 }
 
@@ -87,6 +91,12 @@ export interface WorkflowState {
    */
   runStatus: RunStatus;
   error: string | null;
+  /**
+   * Payload from the `interrupt()` inside the `summary` node — populated
+   * when runStatus is "paused" and consumed by HITLBar to render the bug
+   * report preview alongside the choice buttons. Null otherwise.
+   */
+  interruptPayload: InterruptPayload | null;
 }
 
 // Map each phase to ONLY the nodes that are guaranteed to have run once that
@@ -103,8 +113,10 @@ const PHASE_TO_NODES: Record<string, string[]> = {
   "generating-complete": ["generateTests"],
   healing: ["healTests"],
   "healing-complete": ["healTests"],
-  "awaiting-user-choice": ["finalize"],
-  finalizing: ["finalize"],
+  // `summary` now owns the awaiting-choice + finalizing phases — both happen
+  // inside the single terminal node, not in a separate `finalize` node.
+  "awaiting-user-choice": ["summary"],
+  finalizing: ["summary"],
   complete: ["summary"],
   failed: ["summary"],
 };
@@ -117,6 +129,7 @@ const INITIAL_STATE: WorkflowState = {
   logsByNode: new Map(),
   runStatus: "idle",
   error: null,
+  interruptPayload: null,
 };
 
 export function useWorkflow(): {
@@ -124,6 +137,7 @@ export function useWorkflow(): {
   start: (req: StartRequest) => Promise<void>;
   resume: (choice: UserChoice) => Promise<void>;
   stop: () => Promise<void>;
+  stopServers: () => Promise<void>;
   reset: () => Promise<void>;
 } {
   const [state, setState] = useState<WorkflowState>(() => loadPersistedState() ?? INITIAL_STATE);
@@ -200,6 +214,10 @@ export function useWorkflow(): {
     await fetch("/api/workflow/stop", { method: "POST" });
   }, []);
 
+  const stopServers = useCallback(async () => {
+    await fetch("/api/workflow/stop-servers", { method: "POST" });
+  }, []);
+
   const reset = useCallback(async () => {
     try {
       localStorage.removeItem(STORAGE_KEY);
@@ -208,7 +226,7 @@ export function useWorkflow(): {
     setState(INITIAL_STATE);
   }, []);
 
-  return { state, start, resume, stop, reset };
+  return { state, start, resume, stop, stopServers, reset };
 }
 
 function reduce(prev: WorkflowState, evt: WorkflowEvent): WorkflowState {
@@ -242,7 +260,11 @@ function reduce(prev: WorkflowState, evt: WorkflowEvent): WorkflowState {
       return { ...prev, logsByNode: logs };
     }
     case "awaiting_choice":
-      return { ...prev, runStatus: "paused" };
+      return {
+        ...prev,
+        runStatus: "paused",
+        interruptPayload: evt.payload ?? prev.interruptPayload,
+      };
     case "stopping":
       return { ...prev, runStatus: "stopping" };
     case "finished":
@@ -251,6 +273,7 @@ function reduce(prev: WorkflowState, evt: WorkflowEvent): WorkflowState {
         runStatus: evt.status === "failed" ? "failed" : "complete",
         currentNodes: new Set(),
         nextNodes: new Set(),
+        interruptPayload: null,
       };
     case "stopped":
       return {
@@ -258,6 +281,7 @@ function reduce(prev: WorkflowState, evt: WorkflowEvent): WorkflowState {
         runStatus: "stopped",
         currentNodes: new Set(),
         nextNodes: new Set(),
+        interruptPayload: null,
       };
     case "reset":
       // Server-initiated reset (rare — usually the client drives it via the

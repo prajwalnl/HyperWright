@@ -116,7 +116,8 @@ export const QAState = Annotation.Root({
    * Fixes applied in the most recent healTests invocation. Used by
    * healRouter to honor _healer.md §5.7 exit condition #3 — if an attempt
    * produced zero edits while failures remain, further attempts won't help,
-   * so we bail to finalize instead of spinning through maxHealingAttempts.
+   * so we exit to the terminal `summary` node instead of spinning through
+   * maxHealingAttempts.
    */
   lastAttemptFixes: Annotation<number>({
     reducer: lastWriteWins,

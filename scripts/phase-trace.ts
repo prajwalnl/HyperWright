@@ -12,7 +12,7 @@ async function main() {
     { rawInput: "generate tests for module: payments", sessionDir, testsDir },
     config,
   );
-  const resumed = await graph.invoke(new Command({ resume: "cleanup" }), config);
+  const resumed = await graph.invoke(new Command({ resume: "cancel" }), config);
   const all = [...first.phaseHistory, ...resumed.phaseHistory.slice(first.phaseHistory.length)];
   console.log("FULL mode phase history:\n  " + all.join(" → "));
 
@@ -24,7 +24,7 @@ async function main() {
     { rawInput: "heal failing tests for module: payments", sessionDir: sd2, testsDir: td2 },
     cfg2,
   );
-  const h2 = await graph2.invoke(new Command({ resume: "cleanup" }), cfg2);
+  const h2 = await graph2.invoke(new Command({ resume: "cancel" }), cfg2);
   const hAll = [...h1.phaseHistory, ...h2.phaseHistory.slice(h1.phaseHistory.length)];
   console.log("\nHEAL mode phase history:\n  " + hAll.join(" → "));
 }

@@ -17,7 +17,7 @@ function formatElapsed(ms: number): string {
 }
 
 export function App() {
-  const { state, start, resume, stop, reset } = useWorkflow();
+  const { state, start, resume, stop, stopServers, reset } = useWorkflow();
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
 
   const [localStart, setLocalStart] = useState<number | null>(null);
@@ -73,6 +73,13 @@ export function App() {
 
   const failed = state.snapshot?.status === "failed" || isFailedStatus || !!state.error;
   const hasSession = !!state.snapshot || isTerminal;
+  // Source of truth for "is there anything to tear down right now". Drives
+  // the Stop Servers button enablement in both the sidebar and HITL bar.
+  // Reads the snapshot (live or restored) rather than runStatus — servers
+  // can outlive a completed run because teardown is user-triggered.
+  const serversUp =
+    !!state.snapshot?.servers.backendUp ||
+    !!state.snapshot?.servers.frontendUp;
 
   const snapStart = state.snapshot?.startedAt
     ? Date.parse(state.snapshot.startedAt)
@@ -197,6 +204,23 @@ export function App() {
           finished={isComplete || isFailedStatus}
           error={state.error}
         />
+        {/*
+         * Always-available "Stop Servers" — independent of runStatus so
+         * the user can tear down servers between runs, after a failure,
+         * or while a HITL is open. Disabled when nothing is up.
+         */}
+        <div className="section">
+          <div className="section-title">Servers</div>
+          <button
+            className="secondary"
+            disabled={!serversUp}
+            onClick={() => void stopServers()}
+            title="stop the backend + frontend this session started. Servers are kept alive across runs so iteration is fast — click this when you're done."
+            style={{ width: "100%" }}
+          >
+            {serversUp ? "Stop Servers" : "Servers down"}
+          </button>
+        </div>
       </aside>
 
       <main className="panel panel-center">
@@ -221,8 +245,11 @@ export function App() {
         {isPaused && (
           <HITLBar
             onChoose={resume}
+            onStopServers={() => void stopServers()}
             disabled={!isPaused}
             isNewBranch={state.snapshot?.repo?.isNewBranch ?? false}
+            serversUp={serversUp}
+            bugReportPreview={state.interruptPayload?.bugReportPreview ?? null}
           />
         )}
       </aside>

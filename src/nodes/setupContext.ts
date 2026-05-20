@@ -291,9 +291,9 @@ export async function setupContextNode(
   //                                  (module / scenario / branch targetTypes,
   //                                  and PR-checkout fallthrough.)
   //
-  // isNewBranch is set so finalize knows whether to push to an existing
-  // remote branch (open PR — push appends commits to the PR) or open a new
-  // PR via `gh pr create` (fresh `pw/...` branch).
+  // isNewBranch is set so the `summary` node's create-pr step knows whether
+  // to push to an existing remote branch (open PR — push appends commits to
+  // the PR) or open a new PR via `gh pr create` (fresh `pw/...` branch).
   let checkedOutBranch: string | null = null;
   let isNewBranch = false;
 
@@ -353,7 +353,7 @@ export async function setupContextNode(
     // PR-open path is the only case where we keep an existing remote branch
     // without a user-supplied directive. Everything else (modules, scenarios,
     // branch targetType, and PR-checkout fallthrough) gets a fresh session
-    // branch — finalize will then push that branch and open a new PR.
+    // branch — the `summary` node will then push it and open a new PR.
     let prCheckoutSucceeded = false;
     if (targetType === "pr") {
       l(`[setup] Attempting PR checkout for #${target}...`);
@@ -429,9 +429,9 @@ export async function setupContextNode(
   };
 
   // Session artifacts live as a sibling of the cloned repo, not inside it.
-  // Keeping them out of the working tree means finalize doesn't have to stash
-  // them before `gh pr create`, and a stray `git add -A` can never sweep them
-  // into a PR.
+  // Keeping them out of the working tree means the create-pr step in
+  // `summary` doesn't have to stash them before `gh pr create`, and a stray
+  // `git add -A` can never sweep them into a PR.
   const aiGenFlowDir = path.join(cloneDir, ".ai-test-gen");
   const inputContextPath = path.join(aiGenFlowDir, "input-context.json");
 
